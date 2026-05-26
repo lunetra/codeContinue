@@ -1,13 +1,14 @@
 """suggest.py — CodeContinue inline suggestion engine (improved fork).
 
-Changes from original:
-  • Dynamic language detection by file extension (.rs, .py, .js, .sql, .toml …)
+Improvements over original:
+  • Dynamic language detection by file extension (rs, py, js, sql, toml …)
   • Language-specific system prompts and stop sequences
-  • FIM (Fill-in-the-Middle) support for Ollama /api/generate endpoints
-  • Suffix context sent in chat mode too — model knows what comes after cursor
-  • Request cancellation: new request kills the previous in-flight one instantly
-  • Configurable temperature / top_p / max_tokens via settings
-  • project_context (tree command) kept from original fork
+  • FIM (Fill-in-the-Middle) for Ollama /api/generate — best for qwen2.5-coder
+  • Suffix context in chat mode too — model knows what comes after cursor
+  • Request cancellation: new request kills the in-flight one via threading.Event
+  • Rust symbol index: injects compact project-wide signatures into context
+    (functions, structs, enums, traits, impls) with async mtime-based cache
+  • on_post_save invalidates the symbol cache automatically
 """
 
 import html
@@ -25,6 +26,7 @@ import sublime_plugin
 from .api import build_api_headers
 from .log import _log, _log_error
 from .settings import is_endpoint_configured, show_endpoint_config_panel
+from .symbol_index import get_rust_context, on_file_saved
 from .text_utils import clean_markdown_fences, strip_common_indent
 
 
@@ -32,17 +34,9 @@ from .text_utils import clean_markdown_fences, strip_common_indent
 # Language registry
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Maps lowercase file extension (without dot) -> language config dict.
-# Keys:
-#   name   - human-readable name used in prompts
-#   fence  - markdown code-fence identifier
-#   stops  - stop sequences (keep completions short and clean)
-#   system - system prompt tuned for fast pattern completion in this language
-
 _LANG_REGISTRY = {
     "rs": {
-        "name": "Rust",
-        "fence": "rust",
+        "name": "Rust", "fence": "rust",
         "stops": ["\n\n", "\nfn ", "\npub fn ", "\nimpl ", "\nstruct ", "\nenum ", "\nmod "],
         "system": (
             "You are an expert Rust developer focused on fast inline code completion. "
@@ -54,8 +48,7 @@ _LANG_REGISTRY = {
         ),
     },
     "py": {
-        "name": "Python",
-        "fence": "python",
+        "name": "Python", "fence": "python",
         "stops": ["\n\n", "\ndef ", "\nclass ", "\n# ---", "\nif __name__"],
         "system": (
             "You are an expert Python developer focused on fast inline code completion. "
@@ -65,8 +58,7 @@ _LANG_REGISTRY = {
         ),
     },
     "js": {
-        "name": "JavaScript",
-        "fence": "javascript",
+        "name": "JavaScript", "fence": "javascript",
         "stops": ["\n\n", "\nfunction ", "\nconst ", "\nlet ", "\nvar ", "\nclass ", "\nexport "],
         "system": (
             "You are an expert JavaScript developer focused on fast inline code completion. "
@@ -76,19 +68,17 @@ _LANG_REGISTRY = {
         ),
     },
     "ts": {
-        "name": "TypeScript",
-        "fence": "typescript",
+        "name": "TypeScript", "fence": "typescript",
         "stops": ["\n\n", "\nfunction ", "\nconst ", "\nlet ", "\ninterface ", "\ntype ", "\nclass "],
         "system": (
             "You are an expert TypeScript developer focused on fast inline code completion. "
             "Complete the code exactly where it is left off. "
-            "Use proper TypeScript types and generics where appropriate. "
+            "Use proper TypeScript types and generics. "
             "Output ONLY the code continuation — no explanations, no markdown fences."
         ),
     },
     "go": {
-        "name": "Go",
-        "fence": "go",
+        "name": "Go", "fence": "go",
         "stops": ["\n\n", "\nfunc ", "\ntype ", "\nvar ", "\nconst "],
         "system": (
             "You are an expert Go developer focused on fast inline code completion. "
@@ -98,8 +88,7 @@ _LANG_REGISTRY = {
         ),
     },
     "java": {
-        "name": "Java",
-        "fence": "java",
+        "name": "Java", "fence": "java",
         "stops": ["\n\n", "\npublic ", "\nprivate ", "\nprotected ", "\nclass "],
         "system": (
             "You are an expert Java developer focused on fast inline code completion. "
@@ -108,8 +97,7 @@ _LANG_REGISTRY = {
         ),
     },
     "kt": {
-        "name": "Kotlin",
-        "fence": "kotlin",
+        "name": "Kotlin", "fence": "kotlin",
         "stops": ["\n\n", "\nfun ", "\nclass ", "\nobject ", "\nval ", "\nvar "],
         "system": (
             "You are an expert Kotlin developer focused on fast inline code completion. "
@@ -119,8 +107,7 @@ _LANG_REGISTRY = {
         ),
     },
     "cpp": {
-        "name": "C++",
-        "fence": "cpp",
+        "name": "C++", "fence": "cpp",
         "stops": ["\n\n", "\nvoid ", "\nint ", "\nbool ", "\nclass ", "\nstruct "],
         "system": (
             "You are an expert C++ developer focused on fast inline code completion. "
@@ -129,154 +116,54 @@ _LANG_REGISTRY = {
             "Output ONLY the code continuation — no explanations, no markdown fences."
         ),
     },
-    "cc": {
-        "name": "C++", "fence": "cpp",
-        "stops": ["\n\n", "\nvoid ", "\nint ", "\nbool "],
-        "system": (
-            "You are an expert C++ developer. Complete the code exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations, no markdown fences."
-        ),
-    },
-    "hpp": {
-        "name": "C++ Header", "fence": "cpp",
-        "stops": ["\n\n", "\nvoid ", "\nint "],
-        "system": (
-            "You are an expert C++ developer. Complete the header file exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations, no markdown fences."
-        ),
-    },
-    "c": {
-        "name": "C",
-        "fence": "c",
-        "stops": ["\n\n", "\nvoid ", "\nint ", "\nbool ", "\nstruct "],
-        "system": (
-            "You are an expert C developer focused on fast inline code completion. "
-            "Complete the code exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations, no markdown fences."
-        ),
-    },
-    "h": {
-        "name": "C/C++ Header", "fence": "c",
-        "stops": ["\n\n", "\nvoid ", "\nint "],
-        "system": (
-            "You are an expert C/C++ developer. Complete the header file exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations, no markdown fences."
-        ),
-    },
-    "rb": {
-        "name": "Ruby", "fence": "ruby",
-        "stops": ["\n\n", "\ndef ", "\nclass ", "\nmodule "],
-        "system": (
-            "You are an expert Ruby developer. Complete the code exactly where it is left off. "
-            "Write idiomatic Ruby. "
-            "Output ONLY the code continuation — no explanations, no markdown fences."
-        ),
-    },
-    "php": {
-        "name": "PHP", "fence": "php",
-        "stops": ["\n\n", "\nfunction ", "\nclass ", "\npublic ", "\nprivate "],
-        "system": (
-            "You are an expert PHP developer. Complete the code exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations, no markdown fences."
-        ),
-    },
+    "cc":  {"name": "C++", "fence": "cpp", "stops": ["\n\n", "\nvoid ", "\nint "],
+            "system": "You are an expert C++ developer. Complete the code where it is left off. Output ONLY the continuation."},
+    "hpp": {"name": "C++ Header", "fence": "cpp", "stops": ["\n\n", "\nvoid "],
+            "system": "You are an expert C++ developer. Complete the header where it is left off. Output ONLY the continuation."},
+    "c":   {"name": "C", "fence": "c", "stops": ["\n\n", "\nvoid ", "\nint ", "\nstruct "],
+            "system": "You are an expert C developer. Complete the code where it is left off. Output ONLY the continuation."},
+    "h":   {"name": "C/C++ Header", "fence": "c", "stops": ["\n\n", "\nvoid "],
+            "system": "You are an expert C/C++ developer. Complete the header where it is left off. Output ONLY the continuation."},
+    "rb":  {"name": "Ruby", "fence": "ruby", "stops": ["\n\n", "\ndef ", "\nclass "],
+            "system": "You are an expert Ruby developer. Complete the code where it is left off. Output ONLY the continuation."},
+    "php": {"name": "PHP", "fence": "php", "stops": ["\n\n", "\nfunction ", "\nclass "],
+            "system": "You are an expert PHP developer. Complete the code where it is left off. Output ONLY the continuation."},
     "sql": {
         "name": "SQL", "fence": "sql",
         "stops": ["\n\n", "\nSELECT ", "\nINSERT ", "\nUPDATE ", "\nDELETE ", "\nCREATE "],
         "system": (
             "You are an expert SQL developer. Complete the SQL exactly where it is left off. "
-            "Write clean, readable SQL. "
-            "Output ONLY the SQL continuation — no explanations, no markdown fences."
+            "Write clean, readable SQL. Output ONLY the SQL continuation — no explanations."
         ),
     },
     "toml": {
         "name": "TOML", "fence": "toml",
         "stops": ["\n\n", "\n["],
         "system": (
-            "You are an expert at TOML configuration files (especially Cargo.toml). "
-            "Complete the TOML exactly where it is left off. "
-            "Output ONLY the continuation — no explanations, no markdown fences."
+            "You are an expert at TOML configuration files (especially Cargo.toml for Rust). "
+            "Complete the TOML exactly where it is left off. Output ONLY the continuation."
         ),
     },
-    "yaml": {
-        "name": "YAML", "fence": "yaml",
-        "stops": ["\n\n"],
-        "system": (
-            "You are an expert at YAML configuration. "
-            "Complete the YAML exactly where it is left off, matching indentation precisely. "
-            "Output ONLY the continuation — no explanations, no markdown fences."
-        ),
-    },
-    "yml": {
-        "name": "YAML", "fence": "yaml",
-        "stops": ["\n\n"],
-        "system": (
-            "You are an expert at YAML configuration. "
-            "Complete the YAML exactly where it is left off. "
-            "Output ONLY the continuation — no explanations, no markdown fences."
-        ),
-    },
-    "json": {
-        "name": "JSON", "fence": "json",
-        "stops": ["\n\n", "\n}"],
-        "system": (
-            "You are completing a JSON file. "
-            "Continue exactly where it is left off, maintaining valid JSON. "
-            "Output ONLY the continuation — no explanations."
-        ),
-    },
-    "html": {
-        "name": "HTML", "fence": "html",
-        "stops": ["\n\n"],
-        "system": (
-            "You are an expert HTML developer. Complete the HTML exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations."
-        ),
-    },
-    "css": {
-        "name": "CSS", "fence": "css",
-        "stops": ["\n\n", "\n}"],
-        "system": (
-            "You are an expert CSS developer. Complete the CSS exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations."
-        ),
-    },
-    "scss": {
-        "name": "SCSS", "fence": "scss",
-        "stops": ["\n\n", "\n}"],
-        "system": (
-            "You are an expert SCSS developer. Complete the SCSS exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations."
-        ),
-    },
-    "sh": {
-        "name": "Bash", "fence": "bash",
-        "stops": ["\n\n", "\nfunction ", "\n# ---"],
-        "system": (
-            "You are an expert Bash script developer. Complete the script exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations, no markdown fences."
-        ),
-    },
-    "bash": {
-        "name": "Bash", "fence": "bash",
-        "stops": ["\n\n", "\nfunction "],
-        "system": (
-            "You are an expert Bash script developer. Complete the script exactly where it is left off. "
-            "Output ONLY the code continuation — no explanations."
-        ),
-    },
-    "md": {
-        "name": "Markdown", "fence": "markdown",
-        "stops": ["\n\n\n"],
-        "system": (
-            "You are completing a Markdown document. "
-            "Continue exactly where it is left off, matching the writing style. "
-            "Output ONLY the continuation."
-        ),
-    },
+    "yaml": {"name": "YAML", "fence": "yaml", "stops": ["\n\n"],
+             "system": "You are an expert at YAML. Complete it exactly where it is left off, matching indentation. Output ONLY the continuation."},
+    "yml":  {"name": "YAML", "fence": "yaml", "stops": ["\n\n"],
+             "system": "You are an expert at YAML. Complete it exactly where it is left off. Output ONLY the continuation."},
+    "json": {"name": "JSON", "fence": "json", "stops": ["\n\n", "\n}"],
+             "system": "Complete the JSON exactly where it is left off. Maintain valid JSON. Output ONLY the continuation."},
+    "html": {"name": "HTML", "fence": "html", "stops": ["\n\n"],
+             "system": "You are an expert HTML developer. Complete the HTML where it is left off. Output ONLY the continuation."},
+    "css":  {"name": "CSS", "fence": "css", "stops": ["\n\n", "\n}"],
+             "system": "You are an expert CSS developer. Complete the CSS where it is left off. Output ONLY the continuation."},
+    "scss": {"name": "SCSS", "fence": "scss", "stops": ["\n\n", "\n}"],
+             "system": "You are an expert SCSS developer. Complete the SCSS where it is left off. Output ONLY the continuation."},
+    "sh":   {"name": "Bash", "fence": "bash", "stops": ["\n\n", "\nfunction "],
+             "system": "You are an expert Bash developer. Complete the script where it is left off. Output ONLY the continuation."},
+    "bash": {"name": "Bash", "fence": "bash", "stops": ["\n\n", "\nfunction "],
+             "system": "You are an expert Bash developer. Complete the script where it is left off. Output ONLY the continuation."},
+    "md":   {"name": "Markdown", "fence": "markdown", "stops": ["\n\n\n"],
+             "system": "Complete this Markdown document where it is left off, matching the style. Output ONLY the continuation."},
     "_default": {
-        "name": "code", "fence": "",
-        "stops": ["\n\n"],
+        "name": "code", "fence": "", "stops": ["\n\n"],
         "system": (
             "You are an expert developer focused on fast inline code completion. "
             "Complete the code exactly where it is left off. "
@@ -285,7 +172,6 @@ _LANG_REGISTRY = {
     },
 }
 
-# Sublime syntax name -> extension key (fallback when file has no extension)
 _SYNTAX_TO_EXT = {
     "rust": "rs", "python": "py", "javascript": "js", "typescript": "ts",
     "go": "go", "java": "java", "kotlin": "kt", "c++": "cpp", "c": "c",
@@ -297,29 +183,23 @@ _SYNTAX_TO_EXT = {
 
 
 def detect_language(view):
-    """Return (lang_config_dict, ext_key) for the given view.
-
-    Priority: file extension > Sublime syntax name > _default fallback.
-    """
+    """Return (lang_config, ext_key). Priority: extension > syntax name > default."""
     file_path = view.file_name() or ""
     if file_path:
         _, ext = os.path.splitext(file_path)
         ext_key = ext.lstrip(".").lower()
         if ext_key in _LANG_REGISTRY:
             return _LANG_REGISTRY[ext_key], ext_key
-
     syntax = view.syntax()
     if syntax:
-        syntax_name = syntax.name.lower()
-        ext_key = _SYNTAX_TO_EXT.get(syntax_name)
+        ext_key = _SYNTAX_TO_EXT.get(syntax.name.lower())
         if ext_key:
             return _LANG_REGISTRY[ext_key], ext_key
-
     return _LANG_REGISTRY["_default"], "_default"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FIM helpers  (Qwen2.5-Coder, DeepSeek-Coder, StarCoder2 …)
+# FIM helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 _FIM_PREFIX = "<|fim_prefix|>"
@@ -335,13 +215,16 @@ def _build_fim_prompt(code_before, code_after):
     return _FIM_PREFIX + code_before + _FIM_SUFFIX + code_after + _FIM_MIDDLE
 
 
-def _build_chat_messages(code_before, code_after, lang_config):
-    """OpenAI-style messages array.
-    Includes suffix so the model knows what comes after the cursor (gap filling).
-    """
+def _build_chat_messages(code_before, code_after, lang_config, symbol_context=""):
     system = lang_config["system"]
     fence  = lang_config["fence"]
     name   = lang_config["name"]
+
+    if symbol_context:
+        system = system + (
+            "\n\nProject symbol index (function signatures, structs, enums — "
+            "use these to inform your completion):\n" + symbol_context
+        )
 
     if code_after.strip():
         user_content = (
@@ -364,7 +247,7 @@ def _build_chat_messages(code_before, code_after, lang_config):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Project context  (kept from the original fork — uses the `tree` command)
+# Project tree context (kept from original fork)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_project_context(file_path, max_depth=2):
@@ -382,15 +265,12 @@ def get_project_context(file_path, max_depth=2):
         result = subprocess.run(
             ["tree", "-L", str(max_depth), "-a", "--dirsfirst",
              "-I", "target|__pycache__|node_modules|*.lock|*.log|.git"],
-            cwd=parent_dir,
-            capture_output=True, text=True, timeout=1.2,
+            cwd=parent_dir, capture_output=True, text=True, timeout=1.2,
         )
         if result.returncode == 0:
             return context + "Project Structure:\n" + result.stdout
     except Exception:
         pass
-
-    # Fallback: manual os.walk
     context += "Project Structure:\n"
     try:
         for root, dirs, files in os.walk(parent_dir):
@@ -416,13 +296,13 @@ def get_project_context(file_path, max_depth=2):
 
 # view.id() -> (PhantomSet, [normalized_lines], common_prefix)
 phantoms = {}
-# view.id() -> float  (epoch seconds of last request - for 1s debounce)
+# view.id() -> float  (epoch seconds — debounce)
 last_request_time = {}
 # view.id() -> (request_id_tuple, threading.Event)
 pending_requests = {}
-# view.id() set  - prevents on_modified from clearing during Tab-accept
+# view.id() set — suppresses on_modified during Tab-accept
 suppress_clear = set()
-# view.id() -> float  (grace period end time after Tab-accept)
+# view.id() -> float  (grace period end after accept)
 accept_grace_until = {}
 
 
@@ -476,8 +356,13 @@ class CodeContinueListener(sublime_plugin.EventListener):
             return
         clear_phantoms(view)
 
+    def on_post_save(self, view):
+        """Invalidate symbol cache when a .rs file is saved."""
+        fp = view.file_name()
+        if fp:
+            on_file_saved(fp)
+
     def on_text_command(self, view, command_name, args):
-        """Intercept Enter to trigger a suggestion (when appropriate)."""
         if command_name != "insert":
             return None
         if not args or args.get("characters") != "\n":
@@ -491,7 +376,7 @@ class CodeContinueListener(sublime_plugin.EventListener):
         syntax_name = syntax.name.lower() if syntax else ""
 
         lang_matches = (
-            not trigger_langs   # empty list means all languages
+            not trigger_langs
             or ext_key in [t.lower() for t in trigger_langs]
             or any(t.lower() in syntax_name for t in trigger_langs)
         )
@@ -499,10 +384,9 @@ class CodeContinueListener(sublime_plugin.EventListener):
             return None
 
         vid = view.id()
-        if vid in phantoms:   # suggestion already showing
+        if vid in phantoms:
             return None
 
-        # Debounce: at most one request per second
         now = time.time()
         if now - last_request_time.get(vid, 0) < 1.0:
             return None
@@ -535,12 +419,11 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
 
         cursor = sel[0].begin()
 
-        # Detect language
         lang_config, ext_key = detect_language(view)
         _log("Language: {0} (ext={1})".format(lang_config["name"], ext_key))
 
-        # Build prefix (before cursor) and suffix (after cursor)
-        max_lines     = settings.get("max_context_lines", 50)
+        # ── Prefix + suffix ───────────────────────────────────────────────────
+        max_lines     = settings.get("max_context_lines", 60)
         lines_before  = (max_lines * 2) // 3
         lines_after   = max_lines // 3
         total_lines   = view.rowcol(view.size())[0] + 1
@@ -555,13 +438,24 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         code_before   = full_code[:cursor_offset]
         code_after    = full_code[cursor_offset:]
 
-        project_context = get_project_context(view.file_name(), max_depth=2)
+        # ── Project context ───────────────────────────────────────────────────
+        file_path       = view.file_name()
+        project_context = get_project_context(file_path, max_depth=2)
 
-        # Cancel previous in-flight request
+        # ── Rust symbol index (Rust files only) ───────────────────────────────
+        symbol_context = ""
+        if ext_key == "rs":
+            symbol_context = get_rust_context(file_path, max_chars=700)
+            if symbol_context:
+                _log("Symbol context ({0} chars):\n{1}".format(
+                    len(symbol_context), symbol_context[:300]
+                ))
+
+        # ── Cancel previous in-flight request ────────────────────────────────
         vid = view.id()
         old = pending_requests.get(vid)
         if old:
-            old[1].set()   # signal cancel_event
+            old[1].set()
 
         cancel_event = threading.Event()
         request_id   = (vid, cursor, time.time())
@@ -570,9 +464,9 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         sublime.status_message("CodeContinue: Fetching …")
 
         use_fim     = settings.get("use_fim", _is_ollama_generate(endpoint))
-        temperature = settings.get("temperature", 0.15)
+        temperature = settings.get("temperature", 0.2)
         top_p       = settings.get("top_p", 0.85)
-        max_tokens  = settings.get("max_tokens", 120)
+        max_tokens  = settings.get("max_tokens", 150)
         timeout_s   = settings.get("timeout_ms", 15000) / 1000.0
         stops       = lang_config["stops"]
         headers     = build_api_headers(settings)
@@ -584,16 +478,23 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
 
                 completion = None
 
-                # ── Ollama FIM path ───────────────────────────────────────────
+                # ── Ollama FIM ────────────────────────────────────────────────
                 if use_fim and _is_ollama_generate(endpoint):
                     prefix = code_before
-                    if project_context:
+                    # For FIM, prepend symbol context as comment lines before code
+                    if symbol_context:
                         prefix = (
-                            "# Context:\n# "
-                            + project_context.replace("\n", "\n# ")[:500]
+                            "// Project symbols:\n"
+                            + "\n".join("// " + l for l in symbol_context.splitlines())
                             + "\n\n"
                             + code_before
                         )
+                    elif project_context:
+                        prefix = (
+                            "// " + project_context.replace("\n", "\n// ")[:400]
+                            + "\n\n" + code_before
+                        )
+
                     payload = {
                         "model":  model,
                         "prompt": _build_fim_prompt(prefix, code_after),
@@ -614,12 +515,14 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                         body = json.loads(resp.read().decode())
                         completion = body.get("response", "").strip()
 
-                # ── OpenAI-compatible chat completions path ───────────────────
+                # ── OpenAI chat completions ───────────────────────────────────
                 else:
-                    messages = _build_chat_messages(code_before, code_after, lang_config)
-                    if project_context:
+                    messages = _build_chat_messages(
+                        code_before, code_after, lang_config, symbol_context
+                    )
+                    if project_context and not symbol_context:
                         messages[0]["content"] += (
-                            "\n\nProject context:\n" + project_context[:600]
+                            "\n\nProject context:\n" + project_context[:400]
                         )
                     payload = {
                         "model":       model,
@@ -629,7 +532,7 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                         "top_p":       top_p,
                     }
                     if stops:
-                        payload["stop"] = stops[:4]   # OpenAI allows max 4
+                        payload["stop"] = stops[:4]
 
                     req = urllib.request.Request(
                         endpoint,
@@ -648,7 +551,6 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                 if cancel_event.is_set():
                     return
 
-                # Check we are still the current (most recent) request
                 current = pending_requests.get(vid)
                 if not current or current[0] != request_id:
                     return
@@ -659,7 +561,7 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                         lang_config["name"], completion[:80]
                     ))
                     sublime.set_timeout(
-                        lambda: _present_suggestion(view, cursor, completion), 0
+                        lambda: _present(view, cursor, completion), 0
                     )
                 else:
                     sublime.set_timeout(
@@ -667,14 +569,14 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                     )
 
             except urllib.error.URLError as exc:
-                _log_error("Network error: {0}".format(str(exc)[:120]))
+                _log_error("Network: {0}".format(str(exc)[:120]))
                 sublime.set_timeout(
                     lambda: sublime.status_message(
-                        "CodeContinue: Network error — check endpoint settings."
+                        "CodeContinue: Network error — check endpoint."
                     ), 0
                 )
             except Exception as exc:
-                _log_error("Unexpected error: {0}".format(str(exc)[:120]))
+                _log_error("Error: {0}".format(str(exc)[:120]))
                 sublime.set_timeout(
                     lambda: sublime.status_message("CodeContinue: Error — see console."), 0
                 )
@@ -682,13 +584,13 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         threading.Thread(target=fetch_completion, daemon=True).start()
 
 
-def _present_suggestion(view, cursor, completion):
+def _present(view, cursor, completion):
     sublime.status_message("")
     show_phantom(view, cursor, completion)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Accept command  (Tab — accepts one line at a time, original behaviour kept)
+# Accept command  (Tab — one line at a time, original behaviour)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
@@ -696,7 +598,6 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
     def run(self, edit):
         view = self.view
         vid  = view.id()
-
         if vid not in phantoms:
             return
 
@@ -718,7 +619,6 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
                 [common_prefix + ln for ln in remaining]
                 if common_prefix else remaining
             )
-
             text_to_insert = first_line + ("\n" if rem_lines else "")
             view.insert(edit, insert_pos, text_to_insert)
 
