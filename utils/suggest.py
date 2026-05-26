@@ -1,18 +1,8 @@
-"""suggest.py — CodeContinue inline suggestion engine.
-
-Key design points:
-  • Symbol context goes in the Ollama `system` field (not injected into FIM prefix)
-    → model never confuses metadata comments with code to complete
-  • Current file symbols extracted SYNCHRONOUSLY from view content (always fresh)
-  • Neighbor files: same directory only, lightweight cache, toggleable via setting
-  • FIM prefix/suffix contain only real code — clean signal for the model
-  • Request cancellation via threading.Event
-"""
+"""suggest.py — CodeContinue inline suggestion engine."""
 
 import html
 import json
 import os
-import subprocess
 import threading
 import time
 import urllib.error
@@ -31,82 +21,86 @@ from .text_utils import clean_markdown_fences, strip_common_indent
 # ──────────────────────────────────────────────────────────────────────────────
 # Language registry
 # ──────────────────────────────────────────────────────────────────────────────
+# Stops: only "\n\n" (double blank line).
+# Aggressive stops like "\nmod ", "\nfn " prevent the model from completing
+# natural patterns (e.g. a sequence of `mod x;` declarations).
+# max_tokens already caps output length.
 
 _LANG = {
     "rs": {
         "name": "Rust", "fence": "rust",
-        "stops": ["\n\n", "\nfn ", "\npub fn ", "\nimpl ", "\nstruct ", "\nenum ", "\nmod "],
+        "stops": ["\n\n"],
         "system": (
             "You are a Rust code completion engine. "
-            "Your only job: output the next 1-3 lines of code that naturally follow "
-            "the given context. Rules:\n"
-            "- Output ONLY the code, nothing else.\n"
-            "- No explanations, no markdown, no backticks.\n"
+            "Output the next 1-4 lines that naturally continue the given code. "
+            "Rules:\n"
+            "- Output ONLY raw code — no explanations, no markdown, no backticks.\n"
             "- Match existing indentation and style exactly.\n"
-            "- Use types, functions, and structs already present in the context.\n"
-            "- Do NOT invent new abstractions. Complete what is already started.\n"
-            "- Stop before starting a new fn/impl/struct/mod block."
+            "- Use types, functions, and module names already visible in the context.\n"
+            "- Do NOT invent new abstractions. Complete what is started.\n"
+            "- Stop after completing the immediate logical unit (a line, a block, "
+            "a sequence of similar declarations)."
         ),
     },
     "py": {
         "name": "Python", "fence": "python",
-        "stops": ["\n\n", "\ndef ", "\nclass ", "\n# ---"],
+        "stops": ["\n\n"],
         "system": (
             "You are a Python code completion engine. "
-            "Output the next 1-3 lines that naturally follow the context. "
-            "Output ONLY the code — no explanations, no markdown."
+            "Output the next 1-4 lines that naturally continue the code. "
+            "Output ONLY raw code — no explanations, no markdown."
         ),
     },
     "js": {
         "name": "JavaScript", "fence": "javascript",
-        "stops": ["\n\n", "\nfunction ", "\nconst ", "\nlet ", "\nvar ", "\nclass "],
+        "stops": ["\n\n"],
         "system": (
             "You are a JavaScript code completion engine. "
-            "Output the next 1-3 lines that naturally follow the context. "
-            "Use modern ES2020+ syntax. Output ONLY the code."
+            "Output the next 1-4 lines that naturally continue the code. "
+            "Use modern ES2020+ syntax. Output ONLY raw code."
         ),
     },
     "ts": {
         "name": "TypeScript", "fence": "typescript",
-        "stops": ["\n\n", "\nfunction ", "\nconst ", "\nlet ", "\ninterface ", "\ntype "],
+        "stops": ["\n\n"],
         "system": (
             "You are a TypeScript code completion engine. "
-            "Output the next 1-3 lines that naturally follow the context. "
-            "Use proper types. Output ONLY the code."
+            "Output the next 1-4 lines that naturally continue the code. "
+            "Use proper types. Output ONLY raw code."
         ),
     },
     "go": {
         "name": "Go", "fence": "go",
-        "stops": ["\n\n", "\nfunc ", "\ntype ", "\nvar "],
+        "stops": ["\n\n"],
         "system": (
             "You are a Go code completion engine. "
-            "Output the next 1-3 lines that naturally follow the context. "
-            "Follow Go idioms. Output ONLY the code."
+            "Output the next 1-4 lines that naturally continue the code. "
+            "Follow Go idioms. Output ONLY raw code."
         ),
     },
-    "java":  {"name": "Java",       "fence": "java",       "stops": ["\n\n", "\npublic ", "\nclass "],         "system": "You are a Java code completion engine. Output ONLY the next 1-3 lines of code."},
-    "kt":    {"name": "Kotlin",     "fence": "kotlin",     "stops": ["\n\n", "\nfun ", "\nclass "],            "system": "You are a Kotlin code completion engine. Output ONLY the next 1-3 lines of code."},
-    "cpp":   {"name": "C++",        "fence": "cpp",        "stops": ["\n\n", "\nvoid ", "\nint ", "\nclass "], "system": "You are a C++ code completion engine. Output ONLY the next 1-3 lines of code."},
-    "cc":    {"name": "C++",        "fence": "cpp",        "stops": ["\n\n", "\nvoid ", "\nint "],             "system": "You are a C++ code completion engine. Output ONLY the next 1-3 lines of code."},
-    "hpp":   {"name": "C++ Header", "fence": "cpp",        "stops": ["\n\n"],                                  "system": "You are a C++ code completion engine. Output ONLY the next 1-3 lines of code."},
-    "c":     {"name": "C",          "fence": "c",          "stops": ["\n\n", "\nvoid ", "\nint "],             "system": "You are a C code completion engine. Output ONLY the next 1-3 lines of code."},
-    "h":     {"name": "C Header",   "fence": "c",          "stops": ["\n\n"],                                  "system": "You are a C code completion engine. Output ONLY the next 1-3 lines of code."},
-    "rb":    {"name": "Ruby",       "fence": "ruby",       "stops": ["\n\n", "\ndef ", "\nclass "],            "system": "You are a Ruby code completion engine. Output ONLY the next 1-3 lines of code."},
-    "php":   {"name": "PHP",        "fence": "php",        "stops": ["\n\n", "\nfunction "],                   "system": "You are a PHP code completion engine. Output ONLY the next 1-3 lines of code."},
-    "sql":   {"name": "SQL",        "fence": "sql",        "stops": ["\n\n"],                                  "system": "You are a SQL completion engine. Output ONLY the next 1-3 lines of SQL."},
-    "toml":  {"name": "TOML",       "fence": "toml",       "stops": ["\n\n", "\n["],                           "system": "You are a TOML completion engine. Output ONLY the continuation."},
-    "yaml":  {"name": "YAML",       "fence": "yaml",       "stops": ["\n\n"],                                  "system": "You are a YAML completion engine. Match indentation exactly. Output ONLY the continuation."},
-    "yml":   {"name": "YAML",       "fence": "yaml",       "stops": ["\n\n"],                                  "system": "You are a YAML completion engine. Output ONLY the continuation."},
-    "json":  {"name": "JSON",       "fence": "json",       "stops": ["\n\n", "\n}"],                           "system": "Complete the JSON. Output ONLY valid JSON continuation."},
-    "html":  {"name": "HTML",       "fence": "html",       "stops": ["\n\n"],                                  "system": "You are an HTML completion engine. Output ONLY the next 1-3 lines."},
-    "css":   {"name": "CSS",        "fence": "css",        "stops": ["\n\n", "\n}"],                           "system": "You are a CSS completion engine. Output ONLY the next 1-3 lines."},
-    "scss":  {"name": "SCSS",       "fence": "scss",       "stops": ["\n\n", "\n}"],                           "system": "You are a SCSS completion engine. Output ONLY the next 1-3 lines."},
-    "sh":    {"name": "Bash",       "fence": "bash",       "stops": ["\n\n", "\nfunction "],                   "system": "You are a Bash completion engine. Output ONLY the next 1-3 lines."},
-    "bash":  {"name": "Bash",       "fence": "bash",       "stops": ["\n\n"],                                  "system": "You are a Bash completion engine. Output ONLY the next 1-3 lines."},
-    "md":    {"name": "Markdown",   "fence": "markdown",   "stops": ["\n\n\n"],                                "system": "Continue the Markdown document. Output ONLY the continuation."},
+    "java":  {"name": "Java",       "fence": "java",  "stops": ["\n\n"], "system": "You are a Java code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "kt":    {"name": "Kotlin",     "fence": "kotlin","stops": ["\n\n"], "system": "You are a Kotlin code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "cpp":   {"name": "C++",        "fence": "cpp",   "stops": ["\n\n"], "system": "You are a C++ code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "cc":    {"name": "C++",        "fence": "cpp",   "stops": ["\n\n"], "system": "You are a C++ code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "hpp":   {"name": "C++ Header", "fence": "cpp",   "stops": ["\n\n"], "system": "You are a C++ code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "c":     {"name": "C",          "fence": "c",     "stops": ["\n\n"], "system": "You are a C code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "h":     {"name": "C Header",   "fence": "c",     "stops": ["\n\n"], "system": "You are a C code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "rb":    {"name": "Ruby",       "fence": "ruby",  "stops": ["\n\n"], "system": "You are a Ruby code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "php":   {"name": "PHP",        "fence": "php",   "stops": ["\n\n"], "system": "You are a PHP code completion engine. Output ONLY the next 1-4 lines of raw code."},
+    "sql":   {"name": "SQL",        "fence": "sql",   "stops": ["\n\n"], "system": "You are a SQL completion engine. Output ONLY the next 1-4 lines of SQL."},
+    "toml":  {"name": "TOML",       "fence": "toml",  "stops": ["\n\n"], "system": "You are a TOML completion engine. Output ONLY the continuation."},
+    "yaml":  {"name": "YAML",       "fence": "yaml",  "stops": ["\n\n"], "system": "You are a YAML completion engine. Match indentation exactly. Output ONLY the continuation."},
+    "yml":   {"name": "YAML",       "fence": "yaml",  "stops": ["\n\n"], "system": "You are a YAML completion engine. Output ONLY the continuation."},
+    "json":  {"name": "JSON",       "fence": "json",  "stops": ["\n\n"], "system": "Complete the JSON. Output ONLY valid JSON continuation."},
+    "html":  {"name": "HTML",       "fence": "html",  "stops": ["\n\n"], "system": "You are an HTML completion engine. Output ONLY the next 1-4 lines."},
+    "css":   {"name": "CSS",        "fence": "css",   "stops": ["\n\n"], "system": "You are a CSS completion engine. Output ONLY the next 1-4 lines."},
+    "scss":  {"name": "SCSS",       "fence": "scss",  "stops": ["\n\n"], "system": "You are a SCSS completion engine. Output ONLY the next 1-4 lines."},
+    "sh":    {"name": "Bash",       "fence": "bash",  "stops": ["\n\n"], "system": "You are a Bash completion engine. Output ONLY the next 1-4 lines."},
+    "bash":  {"name": "Bash",       "fence": "bash",  "stops": ["\n\n"], "system": "You are a Bash completion engine. Output ONLY the next 1-4 lines."},
+    "md":    {"name": "Markdown",   "fence": "markdown","stops": ["\n\n\n"], "system": "Continue the Markdown document. Output ONLY the continuation."},
     "_default": {
         "name": "code", "fence": "", "stops": ["\n\n"],
-        "system": "You are a code completion engine. Output ONLY the next 1-3 lines of code.",
+        "system": "You are a code completion engine. Output ONLY the next 1-4 lines of raw code.",
     },
 }
 
@@ -135,6 +129,32 @@ def detect_language(view):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Directory listing  (synchronous, lightweight)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _rs_dir_listing(file_path):
+    """Return names of other .rs files in the same directory.
+
+    This is the most valuable context for mod.rs files — the model can see
+    what modules exist and suggest the appropriate `mod X;` declarations.
+    """
+    if not file_path:
+        return ""
+    d   = os.path.dirname(file_path)
+    cur = os.path.basename(file_path)
+    try:
+        files = sorted(
+            f[:-3] for f in os.listdir(d)   # strip .rs extension
+            if f.endswith(".rs") and f != cur and not f.startswith(".")
+        )
+        if files:
+            return "Rust modules in same directory: " + ", ".join(files[:20])
+    except OSError:
+        pass
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # API helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -143,7 +163,7 @@ _FIM_SUF = "<|fim_suffix|>"
 _FIM_MID = "<|fim_middle|>"
 
 
-def _is_ollama(endpoint):
+def _is_ollama_generate(endpoint):
     return "/api/generate" in endpoint
 
 
@@ -151,62 +171,40 @@ def _fim_prompt(before, after):
     return _FIM_PRE + before + _FIM_SUF + after + _FIM_MID
 
 
-def _chat_messages(before, after, lang, symbol_ctx):
+def _chat_messages(before, after, lang, system_extra):
     system = lang["system"]
-    if symbol_ctx:
-        system += "\n\nProject symbols (use these — do not invent new ones):\n" + symbol_ctx
+    if system_extra:
+        system += "\n\n" + system_extra
 
     fence = lang["fence"]
     name  = lang["name"]
+
     if after.strip():
         user = (
             "{n} — complete the gap at [CURSOR]:\n```{f}\n{b}[CURSOR]{a}\n```\n"
-            "Output ONLY what replaces [CURSOR]."
+            "Output ONLY the raw code that replaces [CURSOR]. No markdown, no backticks."
         ).format(n=name, f=fence, b=before, a=after[:300])
     else:
         user = (
-            "Continue this {n} code:\n```{f}\n{b}\n```\nOutput ONLY the continuation."
+            "Continue this {n} code:\n```{f}\n{b}\n```\n"
+            "Output ONLY the raw continuation. No markdown, no backticks."
         ).format(n=name, f=fence, b=before)
 
-    return [{"role": "system", "content": system},
-            {"role": "user",   "content": user}]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Project tree (kept from original fork, used only in chat mode fallback)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _project_tree(file_path):
-    if not file_path:
-        return ""
-    parent = os.path.dirname(file_path)
-    try:
-        r = subprocess.run(
-            ["tree", "-L", "1", "--dirsfirst",
-             "-I", "target|__pycache__|node_modules|.git"],
-            cwd=parent, capture_output=True, text=True, timeout=1.0,
-        )
-        if r.returncode == 0:
-            return r.stdout[:300]
-    except Exception:
-        pass
-    try:
-        files = sorted(f for f in os.listdir(parent)
-                       if not f.startswith(".") and f != "target")
-        return "\n".join(files[:20])
-    except Exception:
-        return ""
+    return [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Plugin state
 # ──────────────────────────────────────────────────────────────────────────────
 
-phantoms         = {}   # view.id() -> (PhantomSet, [lines], common_prefix)
-last_request     = {}   # view.id() -> float
-pending_requests = {}   # view.id() -> (request_id, threading.Event)
+phantoms         = {}
+last_request     = {}
+pending_requests = {}
 suppress_clear   = set()
-accept_grace     = {}   # view.id() -> float
+accept_grace     = {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -319,32 +317,44 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         _log("Language: {0} (ext={1})".format(lang["name"], ext))
 
         # ── Context window ────────────────────────────────────────────────────
-        max_lines    = settings.get("max_context_lines", 60)
-        n_before     = (max_lines * 2) // 3
-        n_after      = max_lines // 3
-        total_rows   = view.rowcol(view.size())[0] + 1
-        cur_row, _   = view.rowcol(cursor)
-        start_row    = max(0, cur_row - n_before)
-        end_row      = min(total_rows, cur_row + n_after + 1)
-        start_pt     = view.text_point(start_row, 0)
-        end_pt       = view.text_point(end_row, 0) if end_row < total_rows else view.size()
+        max_lines  = settings.get("max_context_lines", 60)
+        n_before   = (max_lines * 2) // 3
+        n_after    = max_lines // 3
+        total_rows = view.rowcol(view.size())[0] + 1
+        cur_row, _ = view.rowcol(cursor)
+        start_row  = max(0, cur_row - n_before)
+        end_row    = min(total_rows, cur_row + n_after + 1)
+        start_pt   = view.text_point(start_row, 0)
+        end_pt     = view.text_point(end_row, 0) if end_row < total_rows else view.size()
 
-        full         = view.substr(sublime.Region(start_pt, end_pt))
-        off          = cursor - start_pt
-        code_before  = full[:off]
-        code_after   = full[off:]
+        full        = view.substr(sublime.Region(start_pt, end_pt))
+        off         = cursor - start_pt
+        code_before = full[:off]
+        code_after  = full[off:]
 
-        # ── Symbol context (Rust only, synchronous for current file) ──────────
-        symbol_ctx = ""
+        # ── Extra context for Rust ────────────────────────────────────────────
+        system_extra = ""
         if ext == "rs":
-            view_content    = view.substr(sublime.Region(0, view.size()))
-            index_neighbors = settings.get("index_neighboring_files", True)
-            symbol_ctx      = get_symbol_context(
-                view.file_name(), view_content,
-                index_neighbors=index_neighbors, max_chars=400,
-            )
+            file_path = view.file_name()
+
+            # 1. Directory listing (always useful, especially for mod.rs)
+            dir_listing = _rs_dir_listing(file_path)
+            if dir_listing:
+                system_extra += dir_listing + "\n"
+
+            # 2. Symbol index (current file + optional neighbors)
+            if file_path:
+                view_content    = view.substr(sublime.Region(0, view.size()))
+                index_neighbors = settings.get("index_neighboring_files", True)
+                sym_ctx = get_symbol_context(
+                    file_path, view_content,
+                    index_neighbors=index_neighbors, max_chars=350,
+                )
+                if sym_ctx:
+                    system_extra += sym_ctx
+
             _log("Symbol context ({0} chars):\n{1}".format(
-                len(symbol_ctx), symbol_ctx
+                len(system_extra), system_extra
             ))
 
         # ── Cancel previous request ───────────────────────────────────────────
@@ -353,13 +363,13 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         if old:
             old[1].set()
 
-        cancel      = threading.Event()
-        req_id      = (vid, cursor, time.time())
+        cancel = threading.Event()
+        req_id = (vid, cursor, time.time())
         pending_requests[vid] = (req_id, cancel)
 
         sublime.status_message("CodeContinue: Fetching …")
 
-        use_fim     = settings.get("use_fim", _is_ollama(endpoint))
+        use_fim     = settings.get("use_fim", _is_ollama_generate(endpoint))
         temperature = settings.get("temperature", 0.2)
         top_p       = settings.get("top_p", 0.85)
         max_tokens  = settings.get("max_tokens", 150)
@@ -371,18 +381,13 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
             try:
                 if cancel.is_set():
                     return
-                completion = None
+                raw = None
 
-                if use_fim and _is_ollama(endpoint):
-                    # ── Ollama FIM ────────────────────────────────────────────
-                    # Symbol context goes in `system` field — NOT in the prefix.
-                    # FIM prefix/suffix contain only real code.
+                if use_fim and _is_ollama_generate(endpoint):
+                    # ── Ollama /api/generate  (FIM) ───────────────────────────
                     system_msg = lang["system"]
-                    if symbol_ctx:
-                        system_msg += (
-                            "\n\nProject symbols (reference only — complete the code, "
-                            "do not repeat these):\n" + symbol_ctx
-                        )
+                    if system_extra:
+                        system_msg += "\n\n" + system_extra
                     payload = {
                         "model":  model,
                         "system": system_msg,
@@ -399,11 +404,11 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                         endpoint, data=json.dumps(payload).encode(), headers=headers
                     )
                     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                        completion = json.loads(resp.read()).get("response", "").strip()
+                        raw = json.loads(resp.read()).get("response", "")
 
                 else:
-                    # ── OpenAI-compatible chat ────────────────────────────────
-                    msgs = _chat_messages(code_before, code_after, lang, symbol_ctx)
+                    # ── OpenAI-compatible chat completions ────────────────────
+                    msgs = _chat_messages(code_before, code_after, lang, system_extra)
                     payload = {
                         "model":       model,
                         "messages":    msgs,
@@ -420,19 +425,24 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                         body    = json.loads(resp.read())
                         choices = body.get("choices", [])
                         if choices:
-                            completion = (
+                            raw = (
                                 choices[0].get("message", {}).get("content", "")
                                 or choices[0].get("text", "")
-                            ).strip()
+                            )
 
                 if cancel.is_set():
                     return
                 if pending_requests.get(vid, (None,))[0] != req_id:
                     return
 
+                # Log raw response BEFORE cleaning (crucial for debugging)
+                _log("Raw response: {0!r}".format((raw or "")[:120]))
+
+                completion = clean_markdown_fences(raw or "")
+
+                _log("Suggestion ({0}): {1!r}".format(lang["name"], completion[:80]))
+
                 if completion:
-                    completion = clean_markdown_fences(completion)
-                    _log("Suggestion ({0}): {1!r}".format(lang["name"], completion[:80]))
                     sublime.set_timeout(lambda: _show(view, cursor, completion), 0)
                 else:
                     sublime.set_timeout(
@@ -469,7 +479,6 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
         vid  = view.id()
         if vid not in phantoms:
             return
-
         ps, remaining, common_prefix = phantoms[vid]
         if not remaining:
             clear_phantoms(view)
@@ -480,13 +489,13 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
 
         suppress_clear.add(vid)
         try:
-            pos        = view.sel()[0].begin()
-            first      = remaining.pop(0)
-            rem        = [common_prefix + l for l in remaining] if common_prefix else remaining
-            insert_txt = first + ("\n" if rem else "")
-            view.insert(edit, pos, insert_txt)
+            pos    = view.sel()[0].begin()
+            first  = remaining.pop(0)
+            rem    = [common_prefix + l for l in remaining] if common_prefix else remaining
+            ins    = first + ("\n" if rem else "")
+            view.insert(edit, pos, ins)
 
-            new_pos = pos + len(insert_txt)
+            new_pos = pos + len(ins)
             view.sel().clear()
             view.sel().add(sublime.Region(new_pos, new_pos))
 

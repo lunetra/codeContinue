@@ -49,6 +49,8 @@
     // Request timeout in milliseconds
     "timeout_ms": 15000,
 
+    "index_neighboring_files": true
+
     // ── Language triggers ─────────────────────────────────────────────────────
     //
     // Language list matched against file extension AND Sublime syntax name.
