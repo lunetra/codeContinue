@@ -1,25 +1,68 @@
 {
-    // API endpoint URL (OpenAI-compatible v1 format)
-    // Examples:
-    //   - OpenAI: "https://api.openai.com/v1/chat/completions"
-    //   - Local: "http://localhost:8000/v1/chat/completions"
-    "endpoint": "",
+    // ── Connection ────────────────────────────────────────────────────────────
+    //
+    // API endpoint URL — two common options:
+    //
+    //   Ollama FIM mode (recommended for qwen2.5-coder):
+    //     "http://localhost:11434/api/generate"
+    //
+    //   Ollama OpenAI-compatible (also works):
+    //     "http://localhost:11434/v1/chat/completions"
+    //
+    //   OpenAI / other cloud:
+    //     "https://api.openai.com/v1/chat/completions"
+    //
+    "endpoint": "http://localhost:11434/api/generate",
 
-    // Model name to use for completions
-    "model": "",
+    // Model name — exactly as shown by `ollama list`
+    "model": "qwen2.5-coder:3b",
 
-    // API key for authentication (optional, only if endpoint requires it)
+    // API key (optional — leave blank for local Ollama)
     "api_key": "",
 
-    // Number of lines of context to send to the model
-    "max_context_lines": 30,
+    // ── FIM (Fill-in-the-Middle) ──────────────────────────────────────────────
+    //
+    // When true and endpoint contains /api/generate, uses FIM mode.
+    // FIM sends BOTH the code before AND after the cursor, so the model
+    // knows exactly what gap to fill — much better for pattern completion.
+    //
+    // Set to false to force chat-completions mode (e.g. for cloud APIs).
+    //
+    "use_fim": true,
+
+    // ── Quality / speed ───────────────────────────────────────────────────────
+    //
+    // Low temperature = deterministic pattern completion (recommended).
+    // Raise slightly (0.3–0.5) if suggestions feel too rigid.
+    "temperature": 0.15,
+    "top_p": 0.85,
+
+    // Max tokens generated per suggestion (keep low for speed)
+    "max_tokens": 120,
+
+    // ── Context ───────────────────────────────────────────────────────────────
+    //
+    // Total lines of code sent to the model (⅔ before cursor, ⅓ after).
+    // More context = smarter suggestions, slower response.
+    "max_context_lines": 50,
 
     // Request timeout in milliseconds
-    "timeout_ms": 30000,
+    "timeout_ms": 15000,
 
-    // Languages to enable suggestions for
-    "trigger_language": ["python", "cpp", "javascript"],
+    // ── Language triggers ─────────────────────────────────────────────────────
+    //
+    // Language list matched against file extension AND Sublime syntax name.
+    // Use the extension without the dot (e.g. "rs" for .rs files).
+    // Leave as an empty array [] to enable for all file types.
+    //
+    "trigger_language": [
+        "rs", "py", "js", "ts", "go", "java", "kt",
+        "cpp", "cc", "c", "h", "hpp",
+        "sql", "toml", "yaml", "yml",
+        "sh", "bash", "json", "html", "css", "scss"
+    ],
 
-    // Enable debug logging to console (View > Show Console)
+    // ── Debug ─────────────────────────────────────────────────────────────────
+    // Set to true to see logs in View > Show Console
     "debug": false
 }
