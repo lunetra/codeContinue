@@ -49,7 +49,7 @@
     // Request timeout in milliseconds
     "timeout_ms": 15000,
 
-    "index_neighboring_files": true
+    "index_neighboring_files": true,
 
     // ── Language triggers ─────────────────────────────────────────────────────
     //
