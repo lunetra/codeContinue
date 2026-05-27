@@ -12,6 +12,7 @@ from .api import build_api_headers
 from .log import _log
 
 
+# ==================== SESSIONS ====================
 _chat_sessions = {}
 _chat_view_ids = set()
 _original_layouts = {}
@@ -20,9 +21,9 @@ _chat_requesting = set()
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert programmer. Be concise, accurate and practical. "
-    "Do not add unnecessary explanations. "
-    "When giving code, output only the code unless asked. "
-    "Keep answers short and direct."
+    "Do not add unnecessary explanations or chit-chat. "
+    "When giving code, output only the code block unless asked otherwise. "
+    "Keep answers short and to the point."
 )
 
 
@@ -45,6 +46,7 @@ def _get_active_model_settings():
     return active or (models[0] if models else {})
 
 
+# ==================== BASE CHAT FUNCTIONALITY ====================
 class CodeContinueChatCommand(sublime_plugin.TextCommand):
     """Open General Chat"""
     def run(self, edit):
@@ -55,7 +57,7 @@ class CodeContinueChatCommand(sublime_plugin.TextCommand):
 
 
 class CodeContinueChatSelectionCommand(sublime_plugin.TextCommand):
-    """Chat about current selection"""
+    """Chat About Selection"""
     def run(self, edit):
         self._open_chat(general=False)
 
@@ -81,13 +83,18 @@ class CodeContinueChatSelectionCommand(sublime_plugin.TextCommand):
         # Split Layout
         wid = window.id()
         _original_layouts[wid] = window.get_layout()
-        window.set_layout({"cols": [0.0, 0.56, 1.0], "rows": [0.0, 1.0], "cells": [[0,0,1,1], [1,0,2,1]]})
+        window.set_layout({
+            "cols": [0.0, 0.56, 1.0],
+            "rows": [0.0, 1.0],
+            "cells": [[0, 0, 1, 1], [1, 0, 2, 1]]
+        })
 
         chat_view = window.new_file()
         chat_view.set_name("CodeContinue Chat")
         chat_view.set_scratch(True)
         chat_view.assign_syntax("Packages/Markdown/Markdown.sublime-syntax")
 
+        # Professional UI
         chat_view.settings().set("word_wrap", True)
         chat_view.settings().set("gutter", False)
         chat_view.settings().set("line_numbers", False)
@@ -109,25 +116,28 @@ class CodeContinueChatSelectionCommand(sublime_plugin.TextCommand):
             "headers": headers,
         }
 
+        # Add selected code if not general chat
         if not general:
             selected = "\n".join(self.view.substr(r) for r in self.view.sel() if not r.empty())
             if selected:
                 session["history"].append({
-                    "role": "user", 
-                    "content": f"Here is the selected code:\n\n```python\n{selected}\n```\n\nPlease help me with this."
+                    "role": "user",
+                    "content": f"Here is the selected code:\n\n```\n{selected}\n```\nPlease help with this."
                 })
 
         _chat_sessions[cvid] = session
 
-        welcome = "═══ CodeContinue Chat ═══\n\n" \
-                  f"Model: {model_name}\n" \
-                  "Be specific and direct in your requests.\n\n" + INPUT_SEPARATOR
+        welcome = (
+            "═══ CodeContinue Chat ═══\n\n"
+            f"Model: {model_name}\n"
+            "Be specific and direct.\n\n" + INPUT_SEPARATOR
+        )
 
         chat_view.run_command("append", {"characters": welcome})
         chat_view.set_read_only(True)
 
 
-# ==================== Event Listener ====================
+# ==================== EVENT LISTENER ====================
 class ChatEventListener(sublime_plugin.EventListener):
 
     def on_text_command(self, view, command_name, args):
@@ -203,16 +213,17 @@ class ChatEventListener(sublime_plugin.EventListener):
                     if reply:
                         session["history"].append({"role": "assistant", "content": reply})
                         def show():
+                            if cvid not in _chat_view_ids: return
                             _chat_remove_thinking(chat_view)
                             _chat_view_append(chat_view, f"\n**Assistant:**\n{reply}\n")
                             _chat_show_input_area(chat_view)
                             _chat_requesting.discard(cvid)
                         sublime.set_timeout(show, 0)
                     else:
-                        self._show_error(chat_view, "Empty response")
+                        self._show_error(chat_view, "Empty response from model.")
 
             except Exception as e:
-                self._show_error(chat_view, str(e)[:150])
+                self._show_error(chat_view, str(e)[:180])
 
         thread = threading.Thread(target=do_request)
         thread.daemon = True
@@ -221,6 +232,7 @@ class ChatEventListener(sublime_plugin.EventListener):
     def _show_error(self, chat_view, msg):
         cvid = chat_view.id()
         def show():
+            if cvid not in _chat_view_ids: return
             _chat_remove_thinking(chat_view)
             _chat_view_append(chat_view, f"\n⚠ {msg}\n")
             _chat_show_input_area(chat_view)
