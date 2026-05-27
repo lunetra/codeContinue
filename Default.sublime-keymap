@@ -1,48 +1,38 @@
 // CodeContinue - Key Bindings
 [
-    // ── Inline phantom ────────────────────────────────────────────────────────
+    // ── Inline phantom suggestion ─────────────────────────────────────────────
     {
-        "keys": [
-            "tab"
-        ],
+        "keys": ["tab"],
         "command": "code_continue_accept",
-        "context": [
-            {
-                "key": "setting.code_continue_visible",
-                "operand": true
-            }
-        ]
+        "context": [{ "key": "setting.code_continue_visible", "operand": true }]
     },
     {
-        "keys": [
-            "escape"
-        ],
+        "keys": ["escape"],
         "command": "code_continue_dismiss",
-        "context": [
-            {
-                "key": "setting.code_continue_visible",
-                "operand": true
-            }
-        ]
+        "context": [{ "key": "setting.code_continue_visible", "operand": true }]
     },
-    // ── Popup (Tab/Enter handled by on_text_command, only ESC needs binding) ──
+
+    // ── Popup suggestion ──────────────────────────────────────────────────────
+    // Tab and Enter: explicit bindings + on_text_command as double safety
     {
-        "keys": [
-            "escape"
-        ],
-        "command": "code_continue_dismiss_popup",
-        "context": [
-            {
-                "key": "setting.code_continue_popup_visible",
-                "operand": true
-            }
-        ]
+        "keys": ["tab"],
+        "command": "code_continue_accept_popup",
+        "context": [{ "key": "setting.code_continue_popup_visible", "operand": true }]
     },
+    {
+        "keys": ["enter"],
+        "command": "code_continue_accept_popup",
+        "context": [{ "key": "setting.code_continue_popup_visible", "operand": true }]
+    },
+    {
+        "keys": ["escape"],
+        "command": "code_continue_dismiss_popup",
+        "context": [{ "key": "setting.code_continue_popup_visible", "operand": true }]
+    },
+
     // ── Manual trigger ────────────────────────────────────────────────────────
     {
-        "keys": [
-            "ctrl+enter"
-        ],
+        "keys": ["ctrl+enter"],
         "command": "code_continue_suggest"
     }
 ]

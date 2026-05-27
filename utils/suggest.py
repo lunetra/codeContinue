@@ -522,15 +522,33 @@ class CodeContinueListener(sublime_plugin.EventListener):
         timer.start()
 
     def on_text_command(self, view, command_name, args):
-        """Intercept Tab / Enter / ESC when popup is visible."""
+        """Intercept Tab / Enter when popup is visible.
+        Tab in Sublime runs insert_best_completion (not insert),
+        so we must check for multiple command names.
+        Use set_timeout to avoid running commands inside on_text_command.
+        """
         vid = view.id()
         if vid not in _popup_suggestion:
             return None
         chars = (args or {}).get("characters", "")
-        # Tab or Enter → accept popup
-        if command_name == "insert" and chars in ("\t", "\n", "\r"):
-            view.run_command("code_continue_accept_popup")
-            return ("noop", None)   # swallow the key
+        # Enter key → insert with \n
+        if command_name == "insert" and chars in ("\n", "\r"):
+            sublime.set_timeout(
+                lambda: view.run_command("code_continue_accept_popup"), 0
+            )
+            return ("noop", None)
+        # Tab key → Sublime runs insert_best_completion or indent
+        if command_name in ("insert_best_completion", "indent", "insert_snippet"):
+            sublime.set_timeout(
+                lambda: view.run_command("code_continue_accept_popup"), 0
+            )
+            return ("noop", None)
+        # Tab as raw insert \t
+        if command_name == "insert" and chars == "\t":
+            sublime.set_timeout(
+                lambda: view.run_command("code_continue_accept_popup"), 0
+            )
+            return ("noop", None)
         return None
 
     def on_post_save(self, view):
