@@ -22,6 +22,7 @@ from .utils.suggest import (  # noqa: F401
     CodeContinueAcceptCommand,
     CodeContinueAcceptPopupCommand,
     CodeContinueDismissCommand,
+    CodeContinueDismissPopupCommand,
     CodeContinueListener,
     CodeContinueSuggestCommand,
 )

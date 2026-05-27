@@ -482,7 +482,7 @@ class CodeContinueListener(sublime_plugin.EventListener):
             return
         typed_char = args.get("characters", "")
         # Must be exactly one non-whitespace, non-newline character
-        if len(typed_char) != 1 or typed_char in " \t\n\r":
+        if len(typed_char) != 1 or typed_char in "\t\n\r":
             return
 
         # ── Grace period after Tab-accept: don't re-trigger immediately ───────
@@ -908,6 +908,7 @@ _popup_suggestion = {}   # view.id() -> (cursor, full_text)
 def show_popup_suggestion(view, cursor, suggestion):
     """Show the full suggestion in a popup panel with Accept/Dismiss buttons."""
     _popup_suggestion[view.id()] = (cursor, suggestion)
+    view.settings().set("code_continue_popup_visible", True)
     lines   = suggestion.split("\n")
     code_html = "<br>".join(
         html.escape(l).replace(" ", "&nbsp;") for l in lines
@@ -932,12 +933,23 @@ def show_popup_suggestion(view, cursor, suggestion):
         max_width=700,
         max_height=350,
         on_navigate=lambda href: _popup_navigate(view, href),
-        on_hide=lambda: _popup_suggestion.pop(view.id(), None),
+        on_hide=lambda: _popup_hidden(view),
     )
+
+
+def _popup_hidden(view):
+    """Called when popup closes for any reason (including backspace)."""
+    # Only clear our state — do NOT close popup (already closed by Sublime)
+    vid = view.id()
+    # If we didn't navigate (e.g. user pressed backspace), just clean up state
+    # but only if popup is truly gone (Sublime calls this after hiding)
+    _popup_suggestion.pop(vid, None)
+    view.settings().erase("code_continue_popup_visible")
 
 
 def _popup_navigate(view, href):
     vid = view.id()
+    view.settings().erase("code_continue_popup_visible")
     if href == "accept":
         entry = _popup_suggestion.pop(vid, None)
         if entry:
@@ -946,6 +958,18 @@ def _popup_navigate(view, href):
     else:
         _popup_suggestion.pop(vid, None)
     view.hide_popup()
+
+
+class CodeContinueDismissPopupCommand(sublime_plugin.TextCommand):
+    """Dismiss popup via keybinding (ESC / button)."""
+    def run(self, edit):
+        self.view.hide_popup()
+        vid = self.view.id()
+        _popup_suggestion.pop(vid, None)
+        self.view.settings().erase("code_continue_popup_visible")
+
+    def is_enabled(self):
+        return self.view.id() in _popup_suggestion
 
 
 class CodeContinueAcceptPopupCommand(sublime_plugin.TextCommand):
