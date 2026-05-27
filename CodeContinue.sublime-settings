@@ -1,70 +1,66 @@
 {
     // ── Connection ────────────────────────────────────────────────────────────
     //
-    // API endpoint URL — two common options:
+    // OpenAI-compatible chat completions endpoint.
+    // For Ollama use: http://localhost:11434/v1/chat/completions
     //
-    //   Ollama FIM mode (recommended for qwen2.5-coder):
-    //     "http://localhost:11434/api/generate"
-    //
-    //   Ollama OpenAI-compatible (also works):
-    //     "http://localhost:11434/v1/chat/completions"
-    //
-    //   OpenAI / other cloud:
-    //     "https://api.openai.com/v1/chat/completions"
-    //
-    "endpoint": "http://localhost:11434/api/generate",
+    "endpoint": "http://localhost:11434/v1/chat/completions",
 
     // Model name — exactly as shown by `ollama list`
     "model": "qwen2.5-coder:3b",
 
-    // API key (optional — leave blank for local Ollama)
-    "api_key": "",
+    // API key — Ollama doesn't check it but the v1 endpoint requires the
+    // field, so any non-empty string works for local use.
+    "api_key": "ollama",
 
-    // ── FIM (Fill-in-the-Middle) ──────────────────────────────────────────────
+    // ── Generation parameters ─────────────────────────────────────────────────
     //
-    // When true and endpoint contains /api/generate, uses FIM mode.
-    // FIM sends BOTH the code before AND after the cursor, so the model
-    // knows exactly what gap to fill — much better for pattern completion.
-    //
-    // Set to false to force chat-completions mode (e.g. for cloud APIs).
-    //
-    "use_fim": true,
+    // Low temperature = deterministic pattern completion.
+    // Raise slightly (0.3-0.4) if completions feel too rigid.
+    "temperature": 0.2,
+    "top_p": 0.9,
 
-    // ── Quality / speed ───────────────────────────────────────────────────────
-    //
-    // Low temperature = deterministic pattern completion (recommended).
-    // Raise slightly (0.3–0.5) if suggestions feel too rigid.
-    "temperature": 0.15,
-    "top_p": 0.85,
-
-    // Max tokens generated per suggestion (keep low for speed)
-    "max_tokens": 120,
+    // Maximum tokens per suggestion. 200 is enough for 4-5 lines of code.
+    // No stop sequences are used — max_tokens is the only length limit.
+    "max_tokens": 200,
 
     // ── Context ───────────────────────────────────────────────────────────────
     //
-    // Total lines of code sent to the model (⅔ before cursor, ⅓ after).
-    // More context = smarter suggestions, slower response.
-    "max_context_lines": 50,
+    // Total code lines around the cursor sent to the model.
+    // ⅔ from before the cursor, ⅓ after.
+    // 60 is good for 3b models. Larger models can handle 80-100.
+    "max_context_lines": 60,
 
-    // Request timeout in milliseconds
-    "timeout_ms": 15000,
+    // Request timeout in ms. Increase for slow models or cold starts.
+    "timeout_ms": 30000,
 
-    "index_neighboring_files": true,
+    // ── Project context (Rust only) ───────────────────────────────────────────
+    //
+    // When true, scans neighboring .rs files in the same directory and
+    // extracts function/struct/enum signatures for use as model context.
+    //
+    // Useful for cross-file completions (calling a function from another module),
+    // but adds noise for small models. Off by default.
+    //
+    // Note: sibling file *names* (the "modules in same directory" list) are
+    // ALWAYS sent regardless of this setting — they're cheap and critical for
+    // mod.rs files.
+    "index_neighboring_files": false,
 
     // ── Language triggers ─────────────────────────────────────────────────────
     //
-    // Language list matched against file extension AND Sublime syntax name.
-    // Use the extension without the dot (e.g. "rs" for .rs files).
-    // Leave as an empty array [] to enable for all file types.
+    // Match against file extension (without dot) AND Sublime syntax name.
+    // Empty array = enabled for all file types.
     //
     "trigger_language": [
-        "rs", "py", "js", "ts", "go", "java", "kt",
-        "cpp", "cc", "c", "h", "hpp",
+        "rs", "py", "js", "ts", "tsx", "jsx",
+        "go", "java", "kt", "cpp", "cc", "c", "h", "hpp",
         "sql", "toml", "yaml", "yml",
         "sh", "bash", "json", "html", "css", "scss"
     ],
 
     // ── Debug ─────────────────────────────────────────────────────────────────
-    // Set to true to see logs in View > Show Console
+    // When true, logs every request to View > Show Console.
+    // Includes the raw model response — invaluable for diagnosing bad output.
     "debug": false
 }
