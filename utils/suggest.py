@@ -1,21 +1,4 @@
-"""suggest.py — CodeContinue inline code completion engine.
-
-Design goals:
-  - Reliable with small models (qwen2.5-coder:3b and up)
-  - Fast, pattern-focused completions — not creative writing
-  - JetBrains-style: knows the project, suggests realistic continuations
-
-Key decisions:
-  - Chat-completions API only (works everywhere — Ollama, OpenAI, OpenRouter…)
-  - NO stop sequences: they cause empty responses when models wrap output in
-    markdown fences. max_tokens limits length naturally.
-  - Robust post-cleanup handles ```fences, special tokens, and trailing
-    explanation paragraphs.
-  - Same-directory file listing always included for the language → key context
-    for module files (mod.rs, __init__.py, index.ts, etc.)
-  - Rust symbol index optional via setting (off by default).
-  - Request cancellation: new request kills the in-flight one.
-"""
+"""suggest.py — CodeContinue inline code completion engine."""
 
 import html
 import json
@@ -29,9 +12,9 @@ import urllib.request
 import sublime
 import sublime_plugin
 
-from .api import build_api_headers
 from .log import _log, _log_error
-from .settings import is_endpoint_configured, show_endpoint_config_panel
+from .model_pool import NoModelsError, get_pool, load_pool_from_settings
+from .settings import show_endpoint_config_panel
 from .symbol_index import get_symbol_context, on_file_saved
 from .text_utils import strip_common_indent
 
@@ -39,9 +22,6 @@ from .text_utils import strip_common_indent
 # ──────────────────────────────────────────────────────────────────────────────
 # Language registry
 # ──────────────────────────────────────────────────────────────────────────────
-# Minimal — just the human name and fence identifier. The same simple prompt
-# template is used for every language; language-specific notes are kept short
-# so they don't overwhelm small models.
 
 LANG = {
     "rs":   {"name": "Rust",       "fence": "rust"},
@@ -85,7 +65,6 @@ SYNTAX_MAP = {
 
 
 def detect_language(view):
-    """Return (lang_config, ext_key). Priority: extension > syntax > default."""
     fp = view.file_name() or ""
     if fp:
         ext = os.path.splitext(fp)[1].lstrip(".").lower()
@@ -100,15 +79,10 @@ def detect_language(view):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Directory listing (sibling files, same extension)
+# Sibling module listing (same dir, same extension)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def list_sibling_modules(file_path, ext):
-    """Return comma-separated stems of sibling files with the same extension.
-
-    Crucial context for module files (mod.rs, __init__.py, index.ts) — tells
-    the model which `mod X;` / `use X;` / `import X` lines are likely.
-    """
     if not file_path or not ext or ext == "_default":
         return ""
     d   = os.path.dirname(file_path)
@@ -127,7 +101,7 @@ def list_sibling_modules(file_path, ext):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Output cleaning — robust to markdown fences and special tokens
+# Output cleaning
 # ──────────────────────────────────────────────────────────────────────────────
 
 _SPECIAL_TOKEN_RE = re.compile(
@@ -139,42 +113,22 @@ _SPECIAL_TOKEN_RE = re.compile(
 
 
 def clean_completion(text):
-    """
-    Robustly extract code from a chat-model response.
-
-    Handles:
-      - Leading blank lines / whitespace
-      - Markdown fences (```rust, ```python, ```)
-      - Trailing explanation paragraphs after a closing fence
-      - Special LLM tokens
-      - Trailing blank lines
-
-    Preserves indentation on real code lines.
-    """
+    """Strip markdown fences, special tokens, and trailing explanations."""
     if not text:
         return ""
-
-    # If response starts with a markdown fence (possibly after blank lines),
-    # strip it (incl. language tag). \s* handles any leading whitespace before
-    # the fence, but we DON'T lstrip the whole string — that would kill
-    # indentation on real code responses.
+    # Strip leading fence (```rust, ```, etc.)
     text = re.sub(r"^\s*```[a-zA-Z_+\-]*\s*\n?", "", text)
-
-    # If there's a closing ``` anywhere, everything after is explanation — drop it
+    # Drop everything after a closing fence (explanations)
     if "```" in text:
         text = text.split("```", 1)[0]
-
-    # Strip known special tokens
+    # Strip special LLM tokens
     text = _SPECIAL_TOKEN_RE.sub("", text)
-
-    # Split into lines, drop leading blanks (preserving indentation on code),
-    # drop trailing blanks
+    # Remove leading/trailing blank lines, preserve internal indentation
     lines = text.split("\n")
     while lines and lines[0].strip() == "":
         lines.pop(0)
     while lines and lines[-1].strip() == "":
         lines.pop()
-
     return "\n".join(lines)
 
 
@@ -182,45 +136,35 @@ def clean_completion(text):
 # Prompt building
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_messages(code_before, code_after, lang, ext, extra_context):
-    """Build OpenAI-style chat messages.
-
-    Simple, direct prompt that works well with small coding models.
-    """
+def build_messages(code_before, code_after, lang, extra_context):
     name  = lang["name"]
     fence = lang["fence"]
 
     system = (
-        "You are a {name} code autocomplete engine. Your output is inserted "
-        "directly into the user's file at the cursor position.\n\n"
-        "Rules — follow them exactly:\n"
-        "1. Output ONLY raw code. No markdown fences, no backticks, no explanations.\n"
-        "2. Match the existing indentation and style of the surrounding code.\n"
-        "3. Output 1-4 lines that naturally continue the pattern.\n"
-        "4. Use types, functions, modules, and names already visible in the context.\n"
-        "5. Do NOT invent new abstractions. Do NOT repeat code that already exists.\n"
+        "You are a {name} code autocomplete engine. "
+        "Your output is inserted directly into the editor at the cursor.\n\n"
+        "Rules:\n"
+        "1. Output ONLY raw code — no markdown fences, no backticks, no explanations.\n"
+        "2. Match the existing indentation and code style exactly.\n"
+        "3. Output 1-4 lines that naturally continue the pattern shown.\n"
+        "4. Use only names, types, and modules already visible in the context.\n"
+        "5. Never repeat code that already exists. Never invent new abstractions.\n"
         "6. Stop when the immediate logical unit is complete."
     ).format(name=name)
 
     if extra_context:
-        system += "\n\nProject context (for reference only — do not repeat):\n" + extra_context
+        system += "\n\nProject context (reference only):\n" + extra_context
 
-    # User message: show the code with a fence so the model knows where it ends.
-    # The cursor position is implicit — code_before ends, code_after follows.
     if code_after.strip():
-        # Mid-file completion — show both sides
         user = (
-            "Complete the gap marked <CURSOR/> in this {name} code. "
-            "Output ONLY the text that goes at <CURSOR/>:\n\n"
+            "Complete the gap at <CURSOR/> in this {name} code.\n"
+            "Output ONLY the raw code that goes at <CURSOR/>:\n\n"
             "```{fence}\n{before}<CURSOR/>{after}\n```"
-        ).format(name=name, fence=fence,
-                 before=code_before,
-                 after=code_after[:400])
+        ).format(name=name, fence=fence, before=code_before, after=code_after[:400])
     else:
-        # End-of-file completion — just show the prefix
         user = (
-            "Continue this {name} code from where it ends. "
-            "Output ONLY the continuation (no repeating existing code):\n\n"
+            "Continue this {name} code. "
+            "Output ONLY the raw continuation (no repeating existing code):\n\n"
             "```{fence}\n{before}\n```"
         ).format(name=name, fence=fence, before=code_before)
 
@@ -234,15 +178,15 @@ def build_messages(code_before, code_after, lang, ext, extra_context):
 # Plugin state
 # ──────────────────────────────────────────────────────────────────────────────
 
-phantoms         = {}   # view.id() -> (PhantomSet, [lines], common_prefix)
-last_request     = {}   # view.id() -> float (debounce)
-pending_requests = {}   # view.id() -> (request_id, cancel_event)
+phantoms         = {}
+last_request     = {}
+pending_requests = {}
 suppress_clear   = set()
-accept_grace     = {}   # view.id() -> float
+accept_grace     = {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Phantom (inline ghost text) display
+# Phantom display
 # ──────────────────────────────────────────────────────────────────────────────
 
 def show_phantom(view, cursor, suggestion):
@@ -273,6 +217,32 @@ def clear_phantoms(view):
         phantoms[vid][0].update([])
         del phantoms[vid]
     view.erase_status("code_continue_visible")
+
+
+def _set_status(view, msg):
+    view.set_status("code_continue", msg)
+
+
+def _clear_status(view):
+    view.erase_status("code_continue")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Settings helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _reload_pool():
+    settings = sublime.load_settings("CodeContinue.sublime-settings")
+    ok = load_pool_from_settings(settings)
+    if ok:
+        _log("Model pool loaded: {0}".format(get_pool().model_names()))
+    else:
+        _log_error("No models configured in CodeContinue.sublime-settings")
+    return ok
+
+
+def _is_pool_ready():
+    return len(get_pool().model_names()) > 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -306,7 +276,6 @@ class CodeContinueListener(sublime_plugin.EventListener):
         syntax        = view.syntax()
         syntax_name   = syntax.name.lower() if syntax else ""
 
-        # Empty trigger_language list = enabled for all
         if trigger_langs and not (
             ext in [t.lower() for t in trigger_langs]
             or any(t.lower() in syntax_name for t in trigger_langs)
@@ -317,7 +286,6 @@ class CodeContinueListener(sublime_plugin.EventListener):
         if vid in phantoms:
             return None
 
-        # Debounce — at most one request per second
         now = time.time()
         if now - last_request.get(vid, 0) < 1.0:
             return None
@@ -336,11 +304,11 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
     def run(self, edit):
         view     = self.view
         settings = sublime.load_settings("CodeContinue.sublime-settings")
-        endpoint = settings.get("endpoint", "")
-        model    = settings.get("model", "")
 
-        if not is_endpoint_configured(settings):
-            sublime.status_message("CodeContinue: Endpoint not configured.")
+        # Reload pool from settings on each request so live edits to settings
+        # take effect without restarting Sublime.
+        if not _reload_pool():
+            _set_status(view, "CC: No models configured")
             sublime.set_timeout(lambda: show_endpoint_config_panel(view), 100)
             return
 
@@ -352,7 +320,7 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         lang, ext = detect_language(view)
         _log("Language: {0} (ext={1})".format(lang["name"], ext))
 
-        # ── Slice context window (before + after cursor) ──────────────────────
+        # ── Context window ────────────────────────────────────────────────────
         max_lines  = settings.get("max_context_lines", 60)
         n_before   = (max_lines * 2) // 3
         n_after    = max_lines // 3
@@ -368,18 +336,16 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         code_before = full[:off]
         code_after  = full[off:]
 
-        # ── Build extra context (directory listing + optional symbols) ────────
+        # ── Extra context ─────────────────────────────────────────────────────
         extra_parts = []
         file_path   = view.file_name()
 
-        # 1. Sibling modules — always useful, especially for module files
         siblings = list_sibling_modules(file_path, ext)
         if siblings:
             extra_parts.append(
                 "Other {0} files in same directory: {1}".format(ext, siblings)
             )
 
-        # 2. Rust symbol index — opt-in via setting
         if ext == "rs" and settings.get("index_neighboring_files", False):
             if file_path:
                 view_content = view.substr(sublime.Region(0, view.size()))
@@ -396,7 +362,9 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                 len(extra_context), extra_context[:300]
             ))
 
-        # ── Cancel previous in-flight request ─────────────────────────────────
+        messages = build_messages(code_before, code_after, lang, extra_context)
+
+        # ── Cancel previous request ───────────────────────────────────────────
         vid = view.id()
         old = pending_requests.get(vid)
         if old:
@@ -406,87 +374,141 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         req_id = (vid, cursor, time.time())
         pending_requests[vid] = (req_id, cancel)
 
-        sublime.status_message("CodeContinue: Fetching …")
-
-        # ── Parameters ────────────────────────────────────────────────────────
-        temperature = settings.get("temperature", 0.2)
-        top_p       = settings.get("top_p", 0.9)
-        max_tokens  = settings.get("max_tokens", 200)
-        timeout_s   = settings.get("timeout_ms", 30000) / 1000.0
-        headers     = build_api_headers(settings)
-
-        messages = build_messages(code_before, code_after, lang, ext, extra_context)
-
-        # NO stop sequences — they cause empty responses when models wrap output
-        # in markdown fences. max_tokens caps the length, post-cleanup strips
-        # whatever wrapping the model adds.
-        payload = {
-            "model":       model,
-            "messages":    messages,
-            "max_tokens":  max_tokens,
-            "temperature": temperature,
-            "top_p":       top_p,
-        }
-
         def fetch():
-            try:
-                if cancel.is_set():
-                    return
+            pool = get_pool()
 
-                req = urllib.request.Request(
-                    endpoint,
-                    data=json.dumps(payload).encode(),
-                    headers=headers,
-                )
-                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                    body    = json.loads(resp.read())
-                    choices = body.get("choices", [])
-                    raw     = ""
-                    if choices:
-                        raw = (
-                            choices[0].get("message", {}).get("content", "")
-                            or choices[0].get("text", "")
-                        )
+            # Try models in rotation. If a 429 happens, mark the key and retry
+            # with the next available model/key — up to len(pool) attempts.
+            max_attempts = max(1, len(pool.model_names()) * 2)
 
+            for attempt in range(max_attempts):
                 if cancel.is_set():
                     return
                 if pending_requests.get(vid, (None,))[0] != req_id:
                     return
 
-                _log("Raw response ({0} chars): {1!r}".format(len(raw), raw[:200]))
-
-                completion = clean_completion(raw)
-
-                _log("Cleaned: {0!r}".format(completion[:200]))
-
-                if completion:
-                    sublime.set_timeout(lambda: _present(view, cursor, completion), 0)
-                else:
+                # ── Acquire a model slot ──────────────────────────────────────
+                try:
+                    slot = pool.acquire()
+                except NoModelsError as e:
+                    _log_error(str(e))
                     sublime.set_timeout(
-                        lambda: sublime.status_message("CodeContinue: No suggestion."), 0
+                        lambda: _set_status(view, "CC: all models rate-limited"), 0
                     )
+                    return
 
-            except urllib.error.URLError as e:
-                _log_error("Network: {0}".format(str(e)[:120]))
+                _log("Using [{0}] attempt {1}".format(slot.display_name, attempt + 1))
                 sublime.set_timeout(
-                    lambda: sublime.status_message("CodeContinue: Network error."), 0
+                    lambda n=slot.display_name: _set_status(
+                        view, "CC: [{0}] …".format(n)
+                    ), 0
                 )
-            except Exception as e:
-                _log_error("Error: {0}".format(str(e)[:120]))
-                sublime.set_timeout(
-                    lambda: sublime.status_message("CodeContinue: Error — see console."), 0
-                )
+
+                # ── Build request ─────────────────────────────────────────────
+                headers = {
+                    "Content-Type":  "application/json",
+                    "Authorization": "Bearer {0}".format(slot.key),
+                }
+                payload = {
+                    "model":       slot.model_id,
+                    "messages":    messages,
+                    "max_tokens":  slot.max_tokens,
+                    "temperature": slot.temperature,
+                    "top_p":       slot.top_p,
+                }
+
+                # ── Make the call ─────────────────────────────────────────────
+                try:
+                    req = urllib.request.Request(
+                        slot.endpoint,
+                        data=json.dumps(payload).encode(),
+                        headers=headers,
+                    )
+                    with urllib.request.urlopen(req, timeout=slot.timeout_s) as resp:
+                        body    = json.loads(resp.read())
+                        choices = body.get("choices", [])
+                        raw     = ""
+                        if choices:
+                            raw = (
+                                choices[0].get("message", {}).get("content", "")
+                                or choices[0].get("text", "")
+                            )
+
+                    pool.report_success(slot)
+                    _log("Raw response [{0}] ({1} chars): {2!r}".format(
+                        slot.display_name, len(raw), raw[:200]
+                    ))
+
+                    if cancel.is_set():
+                        return
+                    if pending_requests.get(vid, (None,))[0] != req_id:
+                        return
+
+                    completion = clean_completion(raw)
+                    _log("Cleaned [{0}]: {1!r}".format(
+                        slot.display_name, completion[:120]
+                    ))
+
+                    if completion:
+                        sublime.set_timeout(
+                            lambda c=completion: _present(view, cursor, c), 0
+                        )
+                    else:
+                        sublime.set_timeout(
+                            lambda: _set_status(view, "CC: no suggestion"), 0
+                        )
+                    return  # ← done
+
+                except urllib.error.HTTPError as e:
+                    if e.code == 429:
+                        _log("429 on [{0}], rotating key …".format(slot.display_name))
+                        pool.report_429(slot)
+                        # Loop → try next slot
+                    else:
+                        _log_error("HTTP {0} on [{1}]".format(e.code, slot.display_name))
+                        pool.report_error(slot)
+                        sublime.set_timeout(
+                            lambda c=e.code: _set_status(
+                                view, "CC: HTTP {0} error".format(c)
+                            ), 0
+                        )
+                        return
+
+                except urllib.error.URLError as e:
+                    _log_error("Network error on [{0}]: {1}".format(
+                        slot.display_name, str(e)[:80]
+                    ))
+                    pool.report_error(slot)
+                    sublime.set_timeout(
+                        lambda: _set_status(view, "CC: network error"), 0
+                    )
+                    return
+
+                except Exception as e:
+                    _log_error("Error on [{0}]: {1}".format(
+                        slot.display_name, str(e)[:80]
+                    ))
+                    pool.report_error(slot)
+                    sublime.set_timeout(
+                        lambda: _set_status(view, "CC: error — see console"), 0
+                    )
+                    return
+
+            # Exhausted all attempts
+            sublime.set_timeout(
+                lambda: _set_status(view, "CC: all models busy, try again soon"), 0
+            )
 
         threading.Thread(target=fetch, daemon=True).start()
 
 
 def _present(view, cursor, text):
-    sublime.status_message("")
+    _clear_status(view)
     show_phantom(view, cursor, text)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Accept command  (Tab — accept one line at a time)
+# Accept command  (Tab — one line at a time)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class CodeContinueAcceptCommand(sublime_plugin.TextCommand):

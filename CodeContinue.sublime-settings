@@ -1,66 +1,75 @@
 {
-    // ── Connection ────────────────────────────────────────────────────────────
+    // ── Models ────────────────────────────────────────────────────────────────
     //
-    // OpenAI-compatible chat completions endpoint.
-    // For Ollama use: http://localhost:11434/v1/chat/completions
+    // List of models tried in order. When a key hits 429, the next key of the
+    // same model is tried. When all keys of a model are cooling down, the next
+    // model is tried. After the last model, rotation wraps back to the first.
     //
-    "endpoint": "http://localhost:11434/v1/chat/completions",
-
-    // Model name — exactly as shown by `ollama list`
-    "model": "qwen2.5-coder:3b",
-
-    // API key — Ollama doesn't check it but the v1 endpoint requires the
-    // field, so any non-empty string works for local use.
-    "api_key": "ollama",
-
-    // ── Generation parameters ─────────────────────────────────────────────────
+    // Per model:
+    //   name     - nickname shown in the status bar (e.g. "CC: [g-flash] …")
+    //   enabled  - set false to skip this model without deleting the config
+    //   endpoint - OpenAI-compatible chat completions URL
+    //   model    - model string passed to the API
+    //   api_keys - one or more API keys; rotated on 429
+    //   temperature, max_tokens, timeout_ms - override per model (optional)
     //
-    // Low temperature = deterministic pattern completion.
-    // Raise slightly (0.3-0.4) if completions feel too rigid.
-    "temperature": 0.2,
-    "top_p": 0.9,
-
-    // Maximum tokens per suggestion. 200 is enough for 4-5 lines of code.
-    // No stop sequences are used — max_tokens is the only length limit.
-    "max_tokens": 200,
-
-    // ── Context ───────────────────────────────────────────────────────────────
-    //
-    // Total code lines around the cursor sent to the model.
-    // ⅔ from before the cursor, ⅓ after.
-    // 60 is good for 3b models. Larger models can handle 80-100.
-    "max_context_lines": 60,
-
-    // Request timeout in ms. Increase for slow models or cold starts.
-    "timeout_ms": 30000,
-
-    // ── Project context (Rust only) ───────────────────────────────────────────
-    //
-    // When true, scans neighboring .rs files in the same directory and
-    // extracts function/struct/enum signatures for use as model context.
-    //
-    // Useful for cross-file completions (calling a function from another module),
-    // but adds noise for small models. Off by default.
-    //
-    // Note: sibling file *names* (the "modules in same directory" list) are
-    // ALWAYS sent regardless of this setting — they're cheap and critical for
-    // mod.rs files.
-    "index_neighboring_files": false,
-
-    // ── Language triggers ─────────────────────────────────────────────────────
-    //
-    // Match against file extension (without dot) AND Sublime syntax name.
-    // Empty array = enabled for all file types.
-    //
-    "trigger_language": [
-        "rs", "py", "js", "ts", "tsx", "jsx",
-        "go", "java", "kt", "cpp", "cc", "c", "h", "hpp",
-        "sql", "toml", "yaml", "yml",
-        "sh", "bash", "json", "html", "css", "scss"
+    "models": [
+        {
+            "name":        "g-flash",
+            "enabled":     true,
+            "endpoint":    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "model":       "gemini-2.5-flash-lite",
+            "api_keys":    [
+                "YOUR_GEMINI_KEY_1",
+                "YOUR_GEMINI_KEY_2"
+            ],
+            "temperature": 0.1,
+            "max_tokens":  100,
+            "timeout_ms":  12000
+        },
+        {
+            "name":        "gpt-mini",
+            "enabled":     true,
+            "endpoint":    "https://models.inference.ai.azure.com/chat/completions",
+            "model":       "gpt-4o-mini",
+            "api_keys":    [
+                "YOUR_GITHUB_PAT_1",
+                "YOUR_GITHUB_PAT_2"
+            ],
+            "temperature": 0.1,
+            "max_tokens":  100,
+            "timeout_ms":  12000
+        },
+        {
+            "name":        "local-3b",
+            "enabled":     false,
+            "endpoint":    "http://localhost:11434/v1/chat/completions",
+            "model":       "qwen2.5-coder:3b",
+            "api_keys":    ["ollama"],
+            "temperature": 0.2,
+            "max_tokens":  150,
+            "timeout_ms":  30000
+        }
     ],
 
-    // ── Debug ─────────────────────────────────────────────────────────────────
-    // When true, logs every request to View > Show Console.
-    // Includes the raw model response — invaluable for diagnosing bad output.
+    // ── Shared settings ───────────────────────────────────────────────────────
+    //
+    // These apply to all models.
+
+    // Total code lines sent around the cursor (⅔ before, ⅓ after).
+    "max_context_lines": 60,
+
+    // Sibling .rs file names are always included for Rust (cheap, useful for
+    // mod.rs files). Set index_neighboring_files to true to also include
+    // function/struct/enum signatures from neighboring files.
+    "index_neighboring_files": false,
+
+    // Languages that trigger completions (file extension without dot).
+    // Empty array = all file types.
+    "trigger_language": [
+        "rs", "toml", "sql"
+    ],
+
+    // Show detailed logs in View > Show Console.
     "debug": false
 }
