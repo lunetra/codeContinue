@@ -13,7 +13,7 @@ Thread-safe. Singleton via module-level _pool.
 
 import threading
 import time
-from typing import Optional
+from typing import Dict, List, Optional
 
 
 # How long a key is skipped after a 429 (seconds)
@@ -96,18 +96,18 @@ class ModelPool:
 
     def __init__(self):
         self._lock   = threading.Lock()
-        self._models: list[_ModelState] = []
+        self._models: List[_ModelState] = []
         self._idx    = 0            # current model pointer
 
     # ── Configuration ─────────────────────────────────────────────────────────
 
-    def load(self, models_cfg: list[dict]):
+    def load(self, models_cfg: List[dict]):
         """Replace the pool with a new list of model configs."""
         with self._lock:
             self._models = [_ModelState(c) for c in models_cfg]
             self._idx    = 0
 
-    def model_names(self) -> list[str]:
+    def model_names(self) -> List[str]:
         with self._lock:
             return [m.name for m in self._models if m.enabled]
 
@@ -170,7 +170,7 @@ class ModelPool:
 
     # ── Status ────────────────────────────────────────────────────────────────
 
-    def status_lines(self) -> list[str]:
+    def status_lines(self) -> List[str]:
         """Human-readable status for each model (for debug logging)."""
         lines = []
         now = time.time()
