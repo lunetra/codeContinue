@@ -87,6 +87,21 @@ def _chat_remove_thinking(chat_view):
         chat_view.set_read_only(True)
 
 
+def _get_active_model_settings():
+    """Get the first enabled model from settings, or the first one if none enabled."""
+    settings = sublime.load_settings("CodeContinue.sublime-settings")
+    models = settings.get("models", [])
+
+    # پیدا کردن اولین مدل فعال
+    active_model = next((m for m in models if m.get("enabled", False)), None)
+    
+    # اگر هیچ مدلی فعال نبود، اولین مدل را برگردان
+    if not active_model and models:
+        active_model = models[0]
+
+    return active_model or {}
+
+
 def _chat_do_api_call(chat_view, session):
     """Send conversation history to LLM and render the response in the chat view."""
     cvid = chat_view.id()
@@ -109,7 +124,7 @@ def _chat_do_api_call(chat_view, session):
         "temperature": 0.5,
     }
 
-    _log("Chat: Sending request to {0}".format(endpoint))
+    _log(f"Chat: Sending request to {endpoint} | Model: {model}")
 
     def do_request():
         try:
@@ -229,8 +244,6 @@ class CodeContinueChatCommand(sublime_plugin.TextCommand):
         if not window:
             return
 
-        settings = sublime.load_settings("CodeContinue.sublime-settings")
-
         selected_text = ""
         for region in view.sel():
             if not region.empty():
@@ -245,6 +258,18 @@ class CodeContinueChatCommand(sublime_plugin.TextCommand):
         syntax = view.settings().get("syntax", "")
         lang = syntax.split("/")[-1].replace(".sublime-syntax", "").lower() if syntax else "unknown"
         base_name = file_name.split("\\")[-1].split("/")[-1]
+
+        # === تنظیمات جدید مدل ===
+        model_config = _get_active_model_settings()
+        endpoint = model_config.get("endpoint", "")
+        model_name = model_config.get("model", "")
+        timeout_ms = model_config.get("timeout_ms", 30000)
+
+        # ساخت هدرها
+        headers = build_api_headers({
+            "endpoint": endpoint,
+            "api_key": model_config.get("api_keys", [None])[0] if model_config.get("api_keys") else None
+        })
 
         wid = window.id()
         _original_layouts[wid] = window.get_layout()
@@ -283,10 +308,10 @@ class CodeContinueChatCommand(sublime_plugin.TextCommand):
                 {"role": "system", "content": CHAT_SYSTEM_PROMPT},
                 {"role": "user", "content": initial_msg},
             ],
-            "endpoint": settings.get("endpoint", ""),
-            "model": settings.get("model", ""),
-            "timeout_s": settings.get("timeout_ms", 30000) / 1000.0,
-            "headers": build_api_headers(settings),
+            "endpoint": endpoint,
+            "model": model_name,
+            "timeout_s": timeout_ms / 1000.0,
+            "headers": headers,
             "code": selected_text,
             "lang": lang,
         }
