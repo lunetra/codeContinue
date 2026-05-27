@@ -1,13 +1,16 @@
 """suggest.py — CodeContinue inline code completion engine.
 
-Improvements in this version:
-  - Multi-line phantom with proper <br> HTML rendering
-  - Debounced auto-trigger: fires after N seconds of typing pause (configurable)
-  - Response alignment: when response arrives, strip the part the user already
-    typed since the request was made — so suggestion always starts at cursor
-  - Compatibility check: if suggestion is incompatible with what was typed, discard
-  - Smart mod.rs context: detects module files and adds pattern hint to prompt
-  - ESC dismiss via keybinding (CodeContinueDismissCommand)
+Features:
+  - Streaming: phantom updates line-by-line as tokens arrive
+  - Smart auto-trigger: fires only after N chars on current line + idle delay
+    (never on Enter alone, never when line is empty)
+  - Animated spinner in status bar (zzz_ prefix → appears at end of bar)
+    shows model name + key index (k1, k2 …)
+  - Comment/explanation stripping from model output
+  - Newline prefix: if cursor sits after a complete statement, suggestion
+    is displayed starting on the next line (no inline concatenation)
+  - Response alignment: strips already-typed prefix from a late response
+  - ESC to dismiss + cancel in-flight request
 """
 
 import html
@@ -93,7 +96,6 @@ def detect_language(view):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def list_sibling_modules(file_path, ext):
-    """Return sorted stems of sibling files with the same extension."""
     if not file_path or not ext or ext == "_default":
         return []
     d   = os.path.dirname(file_path)
@@ -108,35 +110,23 @@ def list_sibling_modules(file_path, ext):
         return []
 
 
-def _is_mod_rs(file_path):
-    """Return True if this is a Rust module index file (mod.rs or lib.rs)."""
-    if not file_path:
-        return False
-    base = os.path.basename(file_path)
-    return base in ("mod.rs", "lib.rs")
-
-
 def build_extra_context(view, file_path, ext, settings):
-    """Build the extra project context injected into the system prompt."""
     parts = []
-
     siblings = list_sibling_modules(file_path, ext)
     if siblings:
         parts.append(
             "Other {0} files in same directory: {1}".format(ext, ", ".join(siblings))
         )
-
-    # Rust-specific context
     if ext == "rs":
-        if _is_mod_rs(file_path):
-            # Help the model understand what mod.rs is for
+        base = os.path.basename(file_path or "")
+        if base in ("mod.rs", "lib.rs"):
             parts.append(
-                "This is a Rust module file (mod.rs / lib.rs). "
-                "Its job is to declare submodules with `mod X;` and "
-                "optionally re-export items with `pub use X::something;`. "
-                "Use ONLY the filenames listed above as module names."
+                "This is a Rust module file ({0}). "
+                "It declares submodules with `mod X;` and re-exports with "
+                "`pub use X::something;`. Use ONLY the filenames listed above "
+                "as module names. Do not invent names that are not in the list."
+                .format(base)
             )
-
         if settings.get("index_neighboring_files", False) and file_path:
             view_content = view.substr(sublime.Region(0, view.size()))
             sym_ctx = get_symbol_context(
@@ -144,7 +134,6 @@ def build_extra_context(view, file_path, ext, settings):
             )
             if sym_ctx:
                 parts.append(sym_ctx)
-
     return "\n".join(parts)
 
 
@@ -159,170 +148,150 @@ _SPECIAL_TOKEN_RE = re.compile(
     r"|\[(?:END_OF_TEXT|/?INST)\]"
 )
 
+# Lines that are pure comments / explanations — strip them
+_COMMENT_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"//.*"           # Rust/JS/TS/Go single-line comment
+    r"|#.*"           # Python/Bash/TOML comment
+    r"|/\*.*\*/"      # Inline block comment
+    r"|--.*"          # SQL comment
+    r")\s*$"
+)
+
+
+def _strip_comment_lines(text):
+    """Remove lines that are purely comments / explanations."""
+    lines = text.split("\n")
+    filtered = [l for l in lines if not _COMMENT_LINE_RE.match(l)]
+    # Drop leading/trailing blank lines that remain after stripping
+    while filtered and filtered[0].strip() == "":
+        filtered.pop(0)
+    while filtered and filtered[-1].strip() == "":
+        filtered.pop()
+    return "\n".join(filtered)
+
 
 def clean_completion(text):
-    """Strip markdown fences, special tokens, and trailing explanations."""
+    """Strip fences, special tokens, comment-only lines, and explanations."""
     if not text:
         return ""
+    # Strip leading markdown fence
     text = re.sub(r"^\s*```[a-zA-Z_+\-]*\s*\n?", "", text)
+    # Drop everything after a closing fence (trailing explanation)
     if "```" in text:
         text = text.split("```", 1)[0]
+    # Strip special LLM tokens
     text = _SPECIAL_TOKEN_RE.sub("", text)
+    # Remove blank lines top/bottom
     lines = text.split("\n")
     while lines and lines[0].strip() == "":
         lines.pop(0)
     while lines and lines[-1].strip() == "":
         lines.pop()
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # Remove pure comment lines
+    text = _strip_comment_lines(text)
+    return text
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Response alignment
+# Newline prefix detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Characters that indicate a complete statement / line
+_COMPLETE_STMT_ENDS = set(";{}")
+
+
+def _cursor_is_after_complete_line(view, cursor):
+    """
+    Return True if the cursor sits at the end of a line that looks complete
+    (ends with ; { } etc.), meaning the suggestion should start on the NEXT line.
+    """
+    row, col = view.rowcol(cursor)
+    line_start = view.text_point(row, 0)
+    line_text  = view.substr(sublime.Region(line_start, cursor)).rstrip()
+    if not line_text:
+        return False
+    return line_text[-1] in _COMPLETE_STMT_ENDS
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Response alignment (trim already-typed prefix from late responses)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def align_completion(completion, typed_since_request):
-    """
-    When a response arrives after the user has continued typing, align it.
-
-    Cases:
-      A) User typed nothing extra → return completion as-is
-      B) Completion starts with what user typed → strip that prefix
-      C) Completion is compatible (starts at the right place) → trim
-      D) Completion is incompatible → return "" (discard)
-
-    "Compatible" means the completion's first non-whitespace content
-    matches or overlaps with where the user's cursor now sits.
-    """
     if not typed_since_request:
         return completion
-
-    typed = typed_since_request
-
-    # Normalise: strip trailing whitespace/newlines from typed
-    typed_stripped = typed.rstrip()
-    if not typed_stripped:
+    typed = typed_since_request.rstrip()
+    if not typed:
         return completion
-
-    # Case B: completion begins with what was typed (common case)
-    if completion.startswith(typed_stripped):
-        rest = completion[len(typed_stripped):]
-        # Strip a single leading newline if the typed text ended mid-line
+    # Case A: completion starts with what was typed → strip it
+    if completion.startswith(typed):
+        rest = completion[len(typed):]
         if rest.startswith("\n"):
             rest = rest[1:]
-        result = rest.lstrip("\n") if not typed_stripped.endswith("\n") else rest
-        return result.rstrip("\n") if result else ""
-
-    # Case C: find where typed_stripped first appears in completion
-    # (user typed something the model also predicted)
-    idx = completion.find(typed_stripped)
+        return rest.strip("\n")
+    # Case B: typed text found inside completion → trim from there
+    idx = completion.find(typed)
     if idx != -1:
-        rest = completion[idx + len(typed_stripped):]
-        return rest.lstrip("\n").rstrip("\n")
-
-    # Case D: if the user typed something substantive (>3 chars) that doesn't
-    # appear anywhere in the completion, the suggestion is stale — discard.
-    if len(typed_stripped) >= 10 and typed_stripped not in completion:
-        _log("Discarding stale completion (typed={0!r})".format(
-            typed_stripped[:40]
-        ))
+        rest = completion[idx + len(typed):]
+        return rest.strip("\n")
+    # Case C: completely incompatible (typed ≥10 chars, not in completion)
+    if len(typed) >= 10 and typed not in completion:
+        _log("Discarding stale completion (typed={0!r})".format(typed[:40]))
         return ""
-
-    # Minimal typed text (newline, 1-3 chars) — keep completion as-is
     return completion
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Prompt building
-# ──────────────────────────────────────────────────────────────────────────────
-
-def build_messages(code_before, code_after, lang, extra_context):
-    name  = lang["name"]
-    fence = lang["fence"]
-
-    system = (
-        "You are a {name} code autocomplete engine. "
-        "Your output is inserted directly into the editor at the cursor.\n\n"
-        "Rules:\n"
-        "1. Output ONLY raw code — no markdown fences, no backticks, no explanations.\n"
-        "2. Match the existing indentation and code style exactly.\n"
-        "3. Output 1-5 lines that naturally continue the pattern shown.\n"
-        "4. Use ONLY names, types, and modules already visible in the context.\n"
-        "5. Never repeat code that already exists. Never invent new names.\n"
-        "6. Stop when the immediate logical unit is complete."
-    ).format(name=name)
-
-    if extra_context:
-        system += "\n\nProject context (reference only):\n" + extra_context
-
-    if code_after.strip():
-        user = (
-            "Complete the gap at <CURSOR/> in this {name} code.\n"
-            "Output ONLY the raw code that goes at <CURSOR/>:\n\n"
-            "```{fence}\n{before}<CURSOR/>{after}\n```"
-        ).format(name=name, fence=fence, before=code_before, after=code_after[:400])
-    else:
-        user = (
-            "Continue this {name} code. "
-            "Output ONLY the raw continuation (no repeating existing code):\n\n"
-            "```{fence}\n{before}\n```"
-        ).format(name=name, fence=fence, before=code_before)
-
-    return [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user},
-    ]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Plugin state
-# ──────────────────────────────────────────────────────────────────────────────
-
-phantoms          = {}   # view.id() -> (PhantomSet, [lines], common_prefix)
-pending_requests  = {}   # view.id() -> (request_id, cancel_event)
-suppress_clear    = set()
-accept_grace      = {}   # view.id() -> float
-_auto_timers      = {}   # view.id() -> threading.Timer  (debounce)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Phantom display  — multi-line with <br>
+# Phantom display  (multi-line via <br>)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _lines_to_html(lines):
-    """Convert a list of code lines to inline HTML with proper line breaks."""
     escaped = [html.escape(l).replace(" ", "&nbsp;") for l in lines]
     return "<br>".join(escaped)
 
 
-def show_phantom(view, cursor, suggestion):
-    clear_phantoms(view)
-    ps    = sublime.PhantomSet(view)
-    lines = suggestion.split("\n")
-    while lines and lines[-1].strip() == "":
-        lines.pop()
-    while lines and lines[0].strip() == "":
-        lines.pop(0)
-    if not lines:
-        return
-
-    norm, prefix = strip_common_indent(lines)
-
-    content = (
+def _make_phantom_html(lines):
+    return (
         '<body id="cc-phantom">'
-        '<span style="color:#888888;font-style:italic;">'
+        '<span style="color:#6e7681;font-style:italic;">'
         '{0}'
         '</span>'
         '</body>'
-    ).format(_lines_to_html(norm))
+    ).format(_lines_to_html(lines))
 
-    ph = sublime.Phantom(
+
+def show_phantom(view, cursor, lines):
+    """Display (or update) the inline ghost-text phantom."""
+    clear_phantoms(view)
+    if not lines:
+        return
+    ps  = sublime.PhantomSet(view, "cc_suggest")
+    ph  = sublime.Phantom(
         sublime.Region(cursor, cursor),
-        content,
+        _make_phantom_html(lines),
         sublime.LAYOUT_INLINE,
     )
     ps.update([ph])
-    phantoms[view.id()] = (ps, norm, prefix)
+    phantoms[view.id()] = (ps, list(lines), cursor)
     view.set_status("code_continue_visible", "true")
+
+
+def update_phantom_lines(view, extra_lines):
+    """Append more lines to an existing phantom (streaming update)."""
+    vid = view.id()
+    if vid not in phantoms:
+        return
+    ps, current_lines, cursor = phantoms[vid]
+    current_lines.extend(extra_lines)
+    ph = sublime.Phantom(
+        sublime.Region(cursor, cursor),
+        _make_phantom_html(current_lines),
+        sublime.LAYOUT_INLINE,
+    )
+    ps.update([ph])
+    phantoms[vid] = (ps, current_lines, cursor)
 
 
 def clear_phantoms(view):
@@ -333,16 +302,83 @@ def clear_phantoms(view):
     view.erase_status("code_continue_visible")
 
 
-def _set_status(view, msg):
-    view.set_status("code_continue", msg)
+# ──────────────────────────────────────────────────────────────────────────────
+# Animated status bar  (key "zzz_cc" → sorts last in the bar)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_STATUS_KEY = "zzz_cc"
+_SPINNER    = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
-def _clear_status(view):
-    view.erase_status("code_continue")
+class _Spinner:
+    """Animates the status bar while a request is in flight."""
+
+    def __init__(self):
+        self._lock   = threading.Lock()
+        self._timer  = None
+        self._view   = None
+        self._label  = ""
+        self._idx    = 0
+        self._active = False
+
+    def start(self, view, label):
+        with self._lock:
+            self._view   = view
+            self._label  = label
+            self._idx    = 0
+            self._active = True
+        self._tick()
+
+    def stop(self):
+        with self._lock:
+            self._active = False
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            view = self._view
+        if view:
+            sublime.set_timeout(
+                lambda: view.erase_status(_STATUS_KEY), 0
+            )
+
+    def set_label(self, label):
+        with self._lock:
+            self._label = label
+
+    def _tick(self):
+        with self._lock:
+            if not self._active:
+                return
+            spin  = _SPINNER[self._idx % len(_SPINNER)]
+            label = self._label
+            view  = self._view
+            self._idx += 1
+        if view:
+            sublime.set_timeout(
+                lambda: view.set_status(
+                    _STATUS_KEY, "{0} {1}".format(spin, label)
+                ), 0
+            )
+        with self._lock:
+            if self._active:
+                self._timer = threading.Timer(0.1, self._tick)
+                self._timer.start()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Settings / pool helpers
+# Plugin state
+# ──────────────────────────────────────────────────────────────────────────────
+
+phantoms         = {}   # view.id() -> (PhantomSet, [lines], cursor)
+pending_requests = {}   # view.id() -> (request_id, cancel_event)
+suppress_clear   = set()
+accept_grace     = {}   # view.id() -> float
+_auto_timers     = {}   # view.id() -> threading.Timer
+_spinner         = _Spinner()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Settings / pool
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _reload_pool():
@@ -350,9 +386,65 @@ def _reload_pool():
     ok = load_pool_from_settings(settings)
     if ok:
         _log("Pool: {0}".format(get_pool().model_names()))
-    else:
-        _log_error("No models configured.")
     return ok
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SSE streaming parser
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _stream_completion(resp, on_line, on_done, cancel_event):
+    """
+    Parse an OpenAI SSE stream.
+    Calls on_line(text) for each complete line of code received.
+    Calls on_done(full_text) when stream ends.
+    Respects cancel_event.
+
+    on_line and on_done are called from the background thread —
+    callers must use sublime.set_timeout for UI updates.
+    """
+    buffer    = ""
+    full_text = ""
+    pending   = []   # complete lines not yet emitted
+
+    for raw in resp:
+        if cancel_event.is_set():
+            return
+
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            continue
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        try:
+            chunk   = json.loads(data)
+            delta   = chunk["choices"][0].get("delta", {})
+            content = delta.get("content") or ""
+        except (KeyError, IndexError, json.JSONDecodeError):
+            continue
+
+        buffer    += content
+        full_text += content
+
+        # Emit complete lines as they arrive
+        while "\n" in buffer:
+            nl_pos   = buffer.index("\n")
+            complete = buffer[:nl_pos]
+            buffer   = buffer[nl_pos + 1:]
+            cleaned  = clean_completion(complete)
+            if cleaned:
+                on_line(cleaned)
+
+    # Emit any remaining partial line
+    if buffer.strip():
+        cleaned = clean_completion(buffer)
+        if cleaned:
+            on_line(cleaned)
+
+    on_done(clean_completion(full_text))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -369,12 +461,11 @@ class CodeContinueListener(sublime_plugin.EventListener):
             if vid not in suppress_clear and time.time() >= accept_grace.get(vid, 0):
                 clear_phantoms(view)
 
-        # ── Debounced auto-trigger ────────────────────────────────────────────
         settings = sublime.load_settings("CodeContinue.sublime-settings")
         if not settings.get("auto_trigger", True):
             return
 
-        # Check language is enabled
+        # ── Language gate ─────────────────────────────────────────────────────
         trigger_langs = settings.get("trigger_language", [])
         _, ext = detect_language(view)
         syntax = view.syntax()
@@ -385,15 +476,34 @@ class CodeContinueListener(sublime_plugin.EventListener):
         ):
             return
 
-        # Cancel previous timer
-        old_timer = _auto_timers.get(vid)
-        if old_timer:
-            old_timer.cancel()
+        # ── Guard: don't trigger on blank lines or too-short lines ────────────
+        sel = view.sel()
+        if not sel:
+            return
+        cursor = sel[0].begin()
+        row, col = view.rowcol(cursor)
+        line_start = view.text_point(row, 0)
+        line_before_cursor = view.substr(
+            sublime.Region(line_start, cursor)
+        ).rstrip()
+
+        min_chars = settings.get("auto_trigger_min_chars", 4)
+        # Count only non-whitespace content on the current line
+        if len(line_before_cursor.strip()) < min_chars:
+            # Cancel any pending timer — line is too short
+            t = _auto_timers.pop(vid, None)
+            if t:
+                t.cancel()
+            return
+
+        # ── Debounce ──────────────────────────────────────────────────────────
+        t = _auto_timers.pop(vid, None)
+        if t:
+            t.cancel()
 
         delay = settings.get("auto_trigger_delay", 0.9)
 
         def _fire():
-            # Run on the Sublime main thread
             sublime.set_timeout(
                 lambda: view.run_command("code_continue_suggest"), 0
             )
@@ -406,39 +516,10 @@ class CodeContinueListener(sublime_plugin.EventListener):
         fp = view.file_name()
         if fp:
             on_file_saved(fp)
-        # Cancel any pending auto-trigger on save
         vid = view.id()
         t = _auto_timers.pop(vid, None)
         if t:
             t.cancel()
-
-    def on_text_command(self, view, command_name, args):
-        """Intercept Enter to optionally trigger (legacy Enter-based mode)."""
-        if command_name != "insert" or not args or args.get("characters") != "\n":
-            return None
-
-        settings = sublime.load_settings("CodeContinue.sublime-settings")
-
-        # If auto_trigger is on, Enter-based trigger is redundant — skip
-        if settings.get("auto_trigger", True):
-            return None
-
-        trigger_langs = settings.get("trigger_language", [])
-        _, ext = detect_language(view)
-        syntax = view.syntax()
-        syntax_name = syntax.name.lower() if syntax else ""
-        if trigger_langs and not (
-            ext in [t.lower() for t in trigger_langs]
-            or any(t.lower() in syntax_name for t in trigger_langs)
-        ):
-            return None
-
-        vid = view.id()
-        if vid in phantoms:
-            return None
-
-        sublime.set_timeout(lambda: view.run_command("code_continue_suggest"), 50)
-        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -452,7 +533,7 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         settings = sublime.load_settings("CodeContinue.sublime-settings")
 
         if not _reload_pool():
-            _set_status(view, "CC: no models configured")
+            view.set_status(_STATUS_KEY, "CC: no models configured")
             sublime.set_timeout(lambda: show_endpoint_config_panel(view), 100)
             return
 
@@ -464,6 +545,9 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         lang, ext = detect_language(view)
         file_path = view.file_name()
         _log("Language: {0} (ext={1})".format(lang["name"], ext))
+
+        # ── Decide if suggestion should start on next line ────────────────────
+        needs_newline_prefix = _cursor_is_after_complete_line(view, cursor)
 
         # ── Context window ────────────────────────────────────────────────────
         max_lines  = settings.get("max_context_lines", 60)
@@ -481,28 +565,26 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         code_before = full[:off]
         code_after  = full[off:]
 
-        # ── Extra context ─────────────────────────────────────────────────────
         extra_context = build_extra_context(view, file_path, ext, settings)
         if extra_context:
             _log("Context: {0}".format(extra_context[:200]))
 
-        messages = build_messages(code_before, code_after, lang, extra_context)
+        messages = _build_messages(code_before, code_after, lang, extra_context)
 
         # ── Cancel previous request ───────────────────────────────────────────
         vid = view.id()
         old = pending_requests.get(vid)
         if old:
             old[1].set()
+            _spinner.stop()
 
-        cancel = threading.Event()
-        req_id = (vid, cursor, time.time())
+        cancel     = threading.Event()
+        req_id     = (vid, cursor, time.time())
+        req_cursor = cursor
         pending_requests[vid] = (req_id, cancel)
 
-        # ── Track cursor position at request time (for alignment) ─────────────
-        request_cursor = cursor   # captured now; user may move cursor while waiting
-
         def fetch():
-            pool = get_pool()
+            pool         = get_pool()
             max_attempts = max(1, len(pool.model_names()) * 2)
 
             for attempt in range(max_attempts):
@@ -515,17 +597,17 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                     slot = pool.acquire()
                 except NoModelsError as e:
                     _log_error(str(e))
+                    _spinner.stop()
                     sublime.set_timeout(
-                        lambda: _set_status(view, "CC: all models rate-limited"), 0
+                        lambda: view.set_status(_STATUS_KEY, "CC: all rate-limited"), 0
                     )
                     return
 
-                _log("[{0}] attempt {1}".format(slot.display_name, attempt + 1))
-                sublime.set_timeout(
-                    lambda n=slot.display_name: _set_status(
-                        view, "CC: [{0}] …".format(n)
-                    ), 0
-                )
+                # Key index (1-based) for display
+                key_idx = slot.model_state.keys.index(slot.key_state) + 1
+                label   = "[{0} k{1}]".format(slot.display_name, key_idx)
+                _spinner.start(view, label)
+                _log("Using {0} attempt {1}".format(label, attempt + 1))
 
                 headers = {
                     "Content-Type":  "application/json",
@@ -537,6 +619,7 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                     "max_tokens":  slot.max_tokens,
                     "temperature": slot.temperature,
                     "top_p":       slot.top_p,
+                    "stream":      True,   # always stream
                 }
 
                 try:
@@ -545,71 +628,115 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                         data=json.dumps(payload).encode(),
                         headers=headers,
                     )
+
+                    t_start   = time.time()
+                    first_tok = [None]   # mutable for closure
+                    collected = []       # list of cleaned lines received so far
+
                     with urllib.request.urlopen(req, timeout=slot.timeout_s) as resp:
-                        body    = json.loads(resp.read())
-                        choices = body.get("choices", [])
-                        raw     = ""
-                        if choices:
-                            raw = (
-                                choices[0].get("message", {}).get("content", "")
-                                or choices[0].get("text", "")
-                            )
+
+                        def on_line(text, needs_nl=needs_newline_prefix):
+                            """Called from background thread for each complete line."""
+                            if cancel.is_set():
+                                return
+                            if pending_requests.get(vid, (None,))[0] != req_id:
+                                return
+
+                            if first_tok[0] is None:
+                                first_tok[0] = time.time()
+                                _log("First token in {0:.2f}s".format(
+                                    first_tok[0] - t_start
+                                ))
+
+                            collected.append(text)
+
+                            # Progressive phantom update
+                            lines_to_show = list(collected)
+                            cur_cursor    = req_cursor  # display at original cursor
+
+                            def _update(lines=lines_to_show, nl=needs_nl, cc=cur_cursor):
+                                if cancel.is_set():
+                                    return
+                                if nl:
+                                    # Insert a visual newline: show blank first line
+                                    display = [""] + lines
+                                else:
+                                    display = lines
+                                show_phantom(view, cc, display)
+
+                            sublime.set_timeout(_update, 0)
+
+                        def on_done(full_text):
+                            """Called from background thread when stream ends."""
+                            if cancel.is_set():
+                                return
+                            if pending_requests.get(vid, (None,))[0] != req_id:
+                                return
+
+                            elapsed = time.time() - t_start
+                            _log("Stream done in {0:.2f}s — full: {1!r}".format(
+                                elapsed, full_text[:120]
+                            ))
+                            _spinner.stop()
+
+                            if not full_text.strip():
+                                sublime.set_timeout(
+                                    lambda: view.set_status(_STATUS_KEY, "CC: no suggestion"), 0
+                                )
+                                return
+
+                            # Alignment check (user may have typed while waiting)
+                            def _align_and_show(ft=full_text, req_cur=req_cursor,
+                                                nl=needs_newline_prefix):
+                                if cancel.is_set():
+                                    return
+                                current_sel = view.sel()
+                                if len(current_sel) != 1:
+                                    clear_phantoms(view)
+                                    return
+                                current_cursor = current_sel[0].begin()
+                                if current_cursor > req_cur:
+                                    typed = view.substr(
+                                        sublime.Region(req_cur, current_cursor)
+                                    )
+                                else:
+                                    typed = ""
+                                aligned = align_completion(ft, typed)
+                                if not aligned:
+                                    clear_phantoms(view)
+                                    return
+                                # Final, definitive phantom from aligned full text
+                                lines = [l for l in aligned.split("\n")]
+                                while lines and lines[0].strip() == "":
+                                    lines.pop(0)
+                                while lines and lines[-1].strip() == "":
+                                    lines.pop()
+                                if not lines:
+                                    clear_phantoms(view)
+                                    return
+                                display = ([""] + lines) if nl else lines
+                                show_phantom(view, current_cursor, display)
+
+                            sublime.set_timeout(_align_and_show, 0)
+
+                        _stream_completion(resp, on_line, on_done, cancel)
 
                     pool.report_success(slot)
-
-                    if cancel.is_set():
-                        return
-                    if pending_requests.get(vid, (None,))[0] != req_id:
-                        return
-
-                    _log("Raw [{0}]: {1!r}".format(slot.display_name, raw[:200]))
-                    completion = clean_completion(raw)
-
-                    if not completion:
-                        sublime.set_timeout(
-                            lambda: _set_status(view, "CC: no suggestion"), 0
-                        )
-                        return
-
-                    # ── Alignment: what did the user type since request? ───────
-                    def _show_aligned(comp=completion, req_cur=request_cursor):
-                        current_sel = view.sel()
-                        if len(current_sel) != 1:
-                            _clear_status(view)
-                            return
-
-                        current_cursor = current_sel[0].begin()
-
-                        # Get text typed since request was sent
-                        if current_cursor > req_cur:
-                            typed_since = view.substr(
-                                sublime.Region(req_cur, current_cursor)
-                            )
-                        else:
-                            typed_since = ""
-
-                        aligned = align_completion(comp, typed_since)
-                        _log("Aligned (typed={0!r}): {1!r}".format(
-                            typed_since[:40], aligned[:80]
-                        ))
-
-                        if aligned:
-                            show_phantom(view, current_cursor, aligned)
-                        _clear_status(view)
-
-                    sublime.set_timeout(_show_aligned, 0)
-                    return
+                    return  # ← done
 
                 except urllib.error.HTTPError as e:
                     if e.code == 429:
                         _log("429 [{0}], rotating …".format(slot.display_name))
                         pool.report_429(slot)
+                        _spinner.stop()
+                        # loop → try next slot
                     else:
                         _log_error("HTTP {0} [{1}]".format(e.code, slot.display_name))
                         pool.report_error(slot)
+                        _spinner.stop()
                         sublime.set_timeout(
-                            lambda c=e.code: _set_status(
-                                view, "CC: HTTP {0}".format(c)
+                            lambda c=e.code: view.set_status(
+                                _STATUS_KEY, "CC: HTTP {0}".format(c)
                             ), 0
                         )
                         return
@@ -619,8 +746,9 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                         slot.display_name, str(e)[:80]
                     ))
                     pool.report_error(slot)
+                    _spinner.stop()
                     sublime.set_timeout(
-                        lambda: _set_status(view, "CC: network error"), 0
+                        lambda: view.set_status(_STATUS_KEY, "CC: network error"), 0
                     )
                     return
 
@@ -629,16 +757,54 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                         slot.display_name, str(e)[:80]
                     ))
                     pool.report_error(slot)
+                    _spinner.stop()
                     sublime.set_timeout(
-                        lambda: _set_status(view, "CC: error — see console"), 0
+                        lambda: view.set_status(_STATUS_KEY, "CC: error"), 0
                     )
                     return
 
+            _spinner.stop()
             sublime.set_timeout(
-                lambda: _set_status(view, "CC: all models busy"), 0
+                lambda: view.set_status(_STATUS_KEY, "CC: all busy"), 0
             )
 
         threading.Thread(target=fetch, daemon=True).start()
+
+
+def _build_messages(code_before, code_after, lang, extra_context):
+    name  = lang["name"]
+    fence = lang["fence"]
+    system = (
+        "You are a {name} code autocomplete engine. "
+        "Your output is inserted directly into the editor.\n\n"
+        "Rules:\n"
+        "1. Output ONLY raw code — no markdown fences, no backticks.\n"
+        "2. NO comments, NO explanations, NO docstrings. Only code lines.\n"
+        "3. Match the existing indentation and code style exactly.\n"
+        "4. Output 1-6 lines that naturally continue the pattern shown.\n"
+        "5. Use ONLY names, types, and modules already visible in the context.\n"
+        "6. Never repeat existing code. Never invent names not in the context.\n"
+        "7. Stop when the immediate logical unit is complete."
+    ).format(name=name)
+    if extra_context:
+        system += "\n\nProject context (reference only):\n" + extra_context
+
+    if code_after.strip():
+        user = (
+            "Complete the gap at <CURSOR/> in this {name} code.\n"
+            "Output ONLY raw code:\n\n"
+            "```{fence}\n{before}<CURSOR/>{after}\n```"
+        ).format(name=name, fence=fence, before=code_before, after=code_after[:400])
+    else:
+        user = (
+            "Continue this {name} code. Output ONLY the raw continuation:\n\n"
+            "```{fence}\n{before}\n```"
+        ).format(name=name, fence=fence, before=code_before)
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -653,8 +819,8 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
         if vid not in phantoms:
             return
 
-        ps, remaining, common_prefix = phantoms[vid]
-        if not remaining:
+        ps, lines, stored_cursor = phantoms[vid]
+        if not lines:
             clear_phantoms(view)
             return
         if len(view.sel()) != 1:
@@ -664,25 +830,28 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
         suppress_clear.add(vid)
         try:
             pos   = view.sel()[0].begin()
-            first = remaining.pop(0)
-            rem   = [common_prefix + l for l in remaining] if common_prefix else remaining
-            ins   = first + ("\n" if rem else "")
-            view.insert(edit, pos, ins)
+            first = lines.pop(0)
+            rem   = list(lines)
 
+            # If first line is blank (newline prefix marker), insert a newline
+            if first.strip() == "":
+                ins = "\n"
+            else:
+                ins = first + ("\n" if rem else "")
+
+            view.insert(edit, pos, ins)
             new_pos = pos + len(ins)
             view.sel().clear()
             view.sel().add(sublime.Region(new_pos, new_pos))
 
             if rem:
-                norm, prefix = strip_common_indent(rem)
-                ps.update([sublime.Phantom(
+                ph = sublime.Phantom(
                     sublime.Region(new_pos, new_pos),
-                    '<body id="cc-phantom">'
-                    '<span style="color:#888888;font-style:italic;">{0}</span>'
-                    '</body>'.format(_lines_to_html(norm)),
+                    _make_phantom_html(rem),
                     sublime.LAYOUT_INLINE,
-                )])
-                phantoms[vid] = (ps, rem, prefix)
+                )
+                ps.update([ph])
+                phantoms[vid] = (ps, rem, new_pos)
             else:
                 clear_phantoms(view)
         finally:
@@ -697,21 +866,15 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
 class CodeContinueDismissCommand(sublime_plugin.TextCommand):
 
     def run(self, edit):
-        view = self.view
-        vid  = view.id()
-
-        # Cancel in-flight request
+        vid = self.view.id()
         old = pending_requests.get(vid)
         if old:
             old[1].set()
-
-        # Cancel pending auto-trigger
         t = _auto_timers.pop(vid, None)
         if t:
             t.cancel()
-
-        clear_phantoms(view)
-        _clear_status(view)
+        _spinner.stop()
+        clear_phantoms(self.view)
 
     def is_enabled(self):
         vid = self.view.id()

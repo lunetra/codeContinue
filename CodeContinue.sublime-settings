@@ -53,7 +53,7 @@
             "timeout_ms": 30000
         }
     ],
-    
+
     // ── Shared settings ───────────────────────────────────────────────────────
     //
     // These apply to all models.
@@ -69,6 +69,7 @@
     //
     "auto_trigger": true,
     "auto_trigger_delay": 0.9,
+    "auto_trigger_min_chars": 4,
 
     // Sibling .rs file names are always included for Rust (cheap, useful for
     // mod.rs files). Set index_neighboring_files to true to also include
