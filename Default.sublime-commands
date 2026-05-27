@@ -10,6 +10,10 @@
         "description": "Get a code suggestion from CodeContinue"
     },
     {
+        "caption": "CodeContinue: Open Chat",
+        "command": "code_continue_chat"
+    },
+    {
         "caption": "Preferences: CodeContinue Settings",
         "command": "edit_settings",
         "args": {
