@@ -1,34 +1,33 @@
+// CodeContinue - Key Bindings
 [
-    [
-        {
-            "keys":[
-                "tab"
-            ],
-            "command":"code_continue_accept",
-            "context":[
-                {
-                    "key":"setting.code_continue_visible",
-                    "operand":true
-                }
-            ]
-        },
-        {
-            "keys":[
-                "escape"
-            ],
-            "command":"code_continue_dismiss",
-            "context":[
-                {
-                    "key":"setting.code_continue_visible",
-                    "operand":true
-                }
-            ]
-        },
-        {
-            "keys":[
-                "ctrl+enter"
-            ],
-            "command":"code_continue_suggest"
-        }
-    ]
+    {
+        "keys": [
+            "tab"
+        ],
+        "command": "code_continue_accept",
+        "context": [
+            {
+                "key": "setting.code_continue_visible",
+                "operand": true
+            }
+        ]
+    },
+    {
+        "keys": [
+            "escape"
+        ],
+        "command": "code_continue_dismiss",
+        "context": [
+            {
+                "key": "setting.code_continue_visible",
+                "operand": true
+            }
+        ]
+    },
+    {
+        "keys": [
+            "ctrl+enter"
+        ],
+        "command": "code_continue_suggest"
+    }
 ]
