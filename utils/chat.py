@@ -12,13 +12,10 @@ from .api import build_api_headers
 from .log import _log
 
 
-# chat_view.id() -> session dict (history, endpoint, model, etc.)
+# chat_view.id() -> session dict
 _chat_sessions = {}
-# chat_view.id() set: identifies chat views (used to gate event listeners)
 _chat_view_ids = set()
-# window.id() -> original layout, restored when the chat view closes
 _original_layouts = {}
-# chat_view.id() set: prevents re-entrant request sending
 _chat_requesting = set()
 
 
@@ -32,7 +29,6 @@ INPUT_SEPARATOR = "\n── Type below and press Enter to send (close tab to end
 
 
 def _chat_view_append(chat_view, text):
-    """Append text to a chat view, preserving its read-only state."""
     was_read_only = chat_view.is_read_only()
     chat_view.set_read_only(False)
     chat_view.run_command("append", {"characters": text})
@@ -42,24 +38,20 @@ def _chat_view_append(chat_view, text):
 
 
 def _chat_get_user_input(chat_view):
-    """Extract the user's typed text (everything after the last separator)."""
     content = chat_view.substr(sublime.Region(0, chat_view.size()))
     sep_pos = content.rfind(INPUT_SEPARATOR)
     if sep_pos == -1:
         return ""
-    input_start = sep_pos + len(INPUT_SEPARATOR)
-    return content[input_start:].strip()
+    return content[sep_pos + len(INPUT_SEPARATOR):].strip()
 
 
 def _chat_show_input_area(chat_view):
-    """Append the input separator and unlock for typing."""
     chat_view.set_read_only(False)
     chat_view.run_command("append", {"characters": INPUT_SEPARATOR})
     chat_view.run_command("move_to", {"to": "eof"})
 
 
 def _chat_lock_and_format_input(chat_view, user_text):
-    """Replace the input area with a formatted user message and lock the view."""
     content = chat_view.substr(sublime.Region(0, chat_view.size()))
     sep_pos = content.rfind(INPUT_SEPARATOR)
     if sep_pos < 0:
@@ -74,7 +66,6 @@ def _chat_lock_and_format_input(chat_view, user_text):
 
 
 def _chat_remove_thinking(chat_view):
-    """Remove the Thinking indicator from the chat view."""
     content = chat_view.substr(sublime.Region(0, chat_view.size()))
     marker = "\n⏳ Thinking...\n"
     pos = content.rfind(marker)
@@ -88,14 +79,10 @@ def _chat_remove_thinking(chat_view):
 
 
 def _get_active_model_settings():
-    """Get the first enabled model from settings, or the first one if none enabled."""
     settings = sublime.load_settings("CodeContinue.sublime-settings")
     models = settings.get("models", [])
 
-    # پیدا کردن اولین مدل فعال
     active_model = next((m for m in models if m.get("enabled", False)), None)
-    
-    # اگر هیچ مدلی فعال نبود، اولین مدل را برگردان
     if not active_model and models:
         active_model = models[0]
 
@@ -103,9 +90,7 @@ def _get_active_model_settings():
 
 
 def _chat_do_api_call(chat_view, session):
-    """Send conversation history to LLM and render the response in the chat view."""
     cvid = chat_view.id()
-
     endpoint = session["endpoint"]
     model = session["model"]
     timeout_s = session["timeout_s"]
@@ -144,7 +129,7 @@ def _chat_do_api_call(chat_view, session):
                         if cvid not in _chat_view_ids:
                             return
                         _chat_remove_thinking(chat_view)
-                        _chat_view_append(chat_view, "\n Assistant: " + reply + "\n")
+                        _chat_view_append(chat_view, f"\n Assistant: {reply}\n")
                         _chat_show_input_area(chat_view)
                         _chat_requesting.discard(cvid)
 
@@ -160,10 +145,10 @@ def _chat_do_api_call(chat_view, session):
                     sublime.set_timeout(show_empty, 0)
 
         except urllib.error.URLError as e:
-            error_msg = str(e)[:150]
+            error_msg = str(e)[:200]
             _log(f"Chat: Network error: {error_msg}")
 
-            def show_net_err(err=error_msg):
+            def show_net_err(err=error_msg):          # Fixed: default argument capture
                 if cvid not in _chat_view_ids:
                     return
                 _chat_remove_thinking(chat_view)
@@ -174,10 +159,10 @@ def _chat_do_api_call(chat_view, session):
             sublime.set_timeout(show_net_err, 0)
 
         except Exception as e:
-            error_msg = str(e)[:150]
+            error_msg = str(e)[:200]
             _log(f"Chat: Error: {error_msg}")
 
-            def show_gen_err(err=error_msg):
+            def show_gen_err(err=error_msg):          # Fixed: default argument capture
                 if cvid not in _chat_view_ids:
                     return
                 _chat_remove_thinking(chat_view)
@@ -193,7 +178,6 @@ def _chat_do_api_call(chat_view, session):
 
 
 def _chat_send_message(chat_view):
-    """Extract user input, format it, and send to LLM."""
     cvid = chat_view.id()
     session = _chat_sessions.get(cvid)
     if not session or cvid in _chat_requesting:
@@ -211,22 +195,17 @@ def _chat_send_message(chat_view):
 
 
 class ChatEventListener(sublime_plugin.EventListener):
-    """Handle Enter key and view close in chat views."""
-
     def on_text_command(self, view, command_name, args):
         if view.id() not in _chat_view_ids:
             return None
 
         if command_name == "insert" and args and args.get("characters") == "\n":
-            user_text = _chat_get_user_input(view)
-            if user_text and view.id() not in _chat_requesting:
+            if _chat_get_user_input(view) and view.id() not in _chat_requesting:
                 _chat_send_message(view)
                 return ("noop", None)
-
         return None
 
     def on_close(self, view):
-        """Clean up when a chat view is closed and restore window layout."""
         vid = view.id()
         if vid not in _chat_view_ids:
             return
@@ -239,24 +218,16 @@ class ChatEventListener(sublime_plugin.EventListener):
         if window and window.id() in _original_layouts:
             layout = _original_layouts.pop(window.id())
             sublime.set_timeout(lambda: window.set_layout(layout), 100)
-            _log("Chat: Restored original layout")
 
 
 class CodeContinueChatCommand(sublime_plugin.TextCommand):
-    """Open a split-window chat about selected code."""
-
     def run(self, edit):
         view = self.view
         window = view.window()
         if not window:
             return
 
-        selected_text = ""
-        for region in view.sel():
-            if not region.empty():
-                selected_text += view.substr(region) + "\n"
-
-        selected_text = selected_text.strip()
+        selected_text = "\n".join(view.substr(r) for r in view.sel() if not r.empty()).strip()
         if not selected_text:
             sublime.status_message("CodeContinue: No text selected")
             return
@@ -264,29 +235,23 @@ class CodeContinueChatCommand(sublime_plugin.TextCommand):
         file_name = view.file_name() or "untitled"
         syntax = view.settings().get("syntax", "")
         lang = syntax.split("/")[-1].replace(".sublime-syntax", "").lower() if syntax else "unknown"
-        base_name = file_name.split("\\")[-1].split("/")[-1]
+        base_name = file_name.split("/")[-1].split("\\")[-1]
 
-        # === تنظیمات جدید مدل ===
+        # Get model settings
         model_config = _get_active_model_settings()
         endpoint = model_config.get("endpoint", "")
         model_name = model_config.get("model", "")
         timeout_ms = model_config.get("timeout_ms", 30000)
 
-        # ساخت هدرها
         headers = build_api_headers({
             "endpoint": endpoint,
             "api_key": model_config.get("api_keys", [None])[0] if model_config.get("api_keys") else None
         })
 
+        # Layout
         wid = window.id()
         _original_layouts[wid] = window.get_layout()
-
-        window.set_layout({
-            "cols": [0.0, 0.6, 1.0],
-            "rows": [0.0, 1.0],
-            "cells": [[0, 0, 1, 1], [1, 0, 2, 1]],
-        })
-
+        window.set_layout({"cols": [0.0, 0.6, 1.0], "rows": [0.0, 1.0], "cells": [[0,0,1,1], [1,0,2,1]]})
         window.set_view_index(view, 0, 0)
 
         chat_view = window.new_file()
@@ -296,19 +261,13 @@ class CodeContinueChatCommand(sublime_plugin.TextCommand):
         chat_view.settings().set("word_wrap", True)
         chat_view.settings().set("gutter", False)
         chat_view.settings().set("line_numbers", False)
-        chat_view.settings().set("rulers", [])
-        chat_view.settings().set("draw_indent_guides", False)
         window.set_view_index(chat_view, 1, 0)
         window.focus_view(chat_view)
 
         cvid = chat_view.id()
         _chat_view_ids.add(cvid)
 
-        initial_msg = (
-            "Here is the selected code from `{0}` ({1}):\n\n"
-            "```\n{2}\n```\n\n"
-            "I'd like to discuss this code."
-        ).format(base_name, lang, selected_text)
+        initial_msg = f"Here is the selected code from `{base_name}` ({lang}):\n\n```\n{selected_text}\n```\n\nI'd like to discuss this code."
 
         session = {
             "history": [
@@ -324,13 +283,7 @@ class CodeContinueChatCommand(sublime_plugin.TextCommand):
         }
         _chat_sessions[cvid] = session
 
-        header = (
-            "═══ CodeContinue Chat ═══\n"
-            "File: {0}  |  Language: {1}\n\n"
-            "─── Selected Code ───\n"
-            "{2}\n"
-        ).format(base_name, lang, selected_text)
-
+        header = f"═══ CodeContinue Chat ═══\nFile: {base_name}  |  Language: {lang}\n\n─── Selected Code ───\n{selected_text}\n"
         chat_view.run_command("append", {"characters": header})
         chat_view.set_read_only(True)
 
@@ -339,8 +292,4 @@ class CodeContinueChatCommand(sublime_plugin.TextCommand):
         _chat_do_api_call(chat_view, session)
 
     def is_enabled(self):
-        """Only enable when there is a non-empty selection."""
-        for region in self.view.sel():
-            if not region.empty():
-                return True
-        return False
+        return any(not r.empty() for r in self.view.sel())
