@@ -1,13 +1,33 @@
 // CodeContinue - Key Bindings
 [
-    // Accept next line of suggestion
-    { "keys": ["super+1"], "command": "code_continue_accept",
-      "context": [{"key": "setting.code_continue_visible", "operand": "true"}] },
-
-    // Dismiss suggestion / cancel in-flight request
-    { "keys": ["escape"], "command": "code_continue_dismiss",
-      "context": [{"key": "setting.code_continue_visible", "operand": "true"}] },
-
-    // Manual trigger (works even when auto_trigger is off)
-    { "keys": ["ctrl+enter"], "command": "code_continue_suggest" }
+    // Accept next line of inline suggestion (Tab)
+    {
+        "keys": [
+            "tab"
+        ],
+        "command": "code_continue_accept",
+        "context": [
+            {
+                "key": "setting.code_continue_visible",
+                "operand": true
+            }
+        ]
+    },
+    // Dismiss suggestion / cancel request (ESC)
+    // No context needed — is_enabled() handles the guard.
+    // This runs before Sublime's built-in ESC so suggestions are
+    // dismissed first; if none is active, ESC falls through normally.
+    {
+        "keys": [
+            "escape"
+        ],
+        "command": "code_continue_dismiss"
+    },
+    // Manual trigger (always available)
+    {
+        "keys": [
+            "ctrl+enter"
+        ],
+        "command": "code_continue_suggest"
+    }
 ]

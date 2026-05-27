@@ -275,7 +275,7 @@ def show_phantom(view, cursor, lines):
     )
     ps.update([ph])
     phantoms[view.id()] = (ps, list(lines), cursor)
-    view.set_status("code_continue_visible", "true")
+    view.settings().set("code_continue_visible", True)
 
 
 def update_phantom_lines(view, extra_lines):
@@ -299,7 +299,7 @@ def clear_phantoms(view):
     if vid in phantoms:
         phantoms[vid][0].update([])
         del phantoms[vid]
-    view.erase_status("code_continue_visible")
+    view.settings().erase("code_continue_visible")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
