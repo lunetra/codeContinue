@@ -374,7 +374,12 @@ pending_requests = {}   # view.id() -> (request_id, cancel_event)
 suppress_clear   = set()
 accept_grace     = {}   # view.id() -> float  (also blocks auto-trigger)
 _auto_timers     = {}   # view.id() -> threading.Timer
-_last_cmd        = {}   # view.id() -> (command_name, args)  set by on_text_command
+
+
+def _cancel_timer(vid):
+    t = _auto_timers.pop(vid, None)
+    if t:
+        t.cancel()
 _spinner         = _Spinner()
 
 
@@ -458,16 +463,10 @@ def _stream_completion(resp, on_line, on_done, cancel_event):
 
 class CodeContinueListener(sublime_plugin.EventListener):
 
-    def on_text_command(self, view, command_name, args):
-        """Track which command caused the next on_modified."""
-        _last_cmd[view.id()] = (command_name, args or {})
-        return None
-
     def on_modified(self, view):
         vid = view.id()
-        cmd, args = _last_cmd.pop(vid, (None, {}))
 
-        # Clear phantom on any edit (unless Tab-accept is in progress)
+        # Clear phantom on any edit (unless Tab-accept grace period is active)
         if vid in phantoms:
             if vid not in suppress_clear and time.time() >= accept_grace.get(vid, 0):
                 clear_phantoms(view)
@@ -476,17 +475,14 @@ class CodeContinueListener(sublime_plugin.EventListener):
         if not settings.get("auto_trigger", True):
             return
 
-        # ── Only trigger on a single printable character being typed ──────────
-        # Ignore: backspace, delete, enter, paste, Tab-accept, undo, redo, etc.
-        if cmd != "insert":
-            return
-        typed_char = args.get("characters", "")
-        # Must be exactly one non-whitespace, non-newline character
-        if len(typed_char) != 1 or typed_char in "\t\n\r":
+        # ── Don't trigger during Tab-accept (suppress_clear is set) ────────────
+        if vid in suppress_clear:
+            _cancel_timer(vid)
             return
 
-        # ── Grace period after Tab-accept: don't re-trigger immediately ───────
+        # ── Grace period: don't re-trigger right after Tab-accept ─────────────
         if time.time() < accept_grace.get(vid, 0):
+            _cancel_timer(vid)
             return
 
         # ── Language gate ─────────────────────────────────────────────────────
@@ -500,54 +496,48 @@ class CodeContinueListener(sublime_plugin.EventListener):
         ):
             return
 
-        # ── Guard: current line must have enough content ──────────────────────
+        # ── Current line must have enough non-whitespace content ──────────────
         sel = view.sel()
         if not sel:
             return
         cursor = sel[0].begin()
-        row, _col = view.rowcol(cursor)
+        row, _ = view.rowcol(cursor)
         line_start = view.text_point(row, 0)
         line_text  = view.substr(sublime.Region(line_start, cursor))
-
-        min_chars = settings.get("auto_trigger_min_chars", 4)
+        min_chars  = settings.get("auto_trigger_min_chars", 4)
         if len(line_text.strip()) < min_chars:
-            t = _auto_timers.pop(vid, None)
-            if t:
-                t.cancel()
+            _cancel_timer(vid)
             return
 
-        # ── Guard: don't trigger when line already ends a complete statement ───
-        stripped = line_text.rstrip()
-        if stripped and stripped[-1] in ";{}":
-            t = _auto_timers.pop(vid, None)
-            if t:
-                t.cancel()
-            return
-
-        # ── Debounce ──────────────────────────────────────────────────────────
-        t = _auto_timers.pop(vid, None)
-        if t:
-            t.cancel()
-
+        # ── Debounce: fire after N seconds of no further typing ───────────────
+        _cancel_timer(vid)
         delay = settings.get("auto_trigger_delay", 0.9)
-
-        def _fire():
-            sublime.set_timeout(
+        timer = threading.Timer(
+            delay,
+            lambda: sublime.set_timeout(
                 lambda: view.run_command("code_continue_suggest"), 0
             )
-
-        timer = threading.Timer(delay, _fire)
+        )
         _auto_timers[vid] = timer
         timer.start()
+
+    def on_text_command(self, view, command_name, args):
+        """Intercept Tab / Enter / ESC when popup is visible."""
+        vid = view.id()
+        if vid not in _popup_suggestion:
+            return None
+        chars = (args or {}).get("characters", "")
+        # Tab or Enter → accept popup
+        if command_name == "insert" and chars in ("\t", "\n", "\r"):
+            view.run_command("code_continue_accept_popup")
+            return ("noop", None)   # swallow the key
+        return None
 
     def on_post_save(self, view):
         fp = view.file_name()
         if fp:
             on_file_saved(fp)
-        vid = view.id()
-        t = _auto_timers.pop(vid, None)
-        if t:
-            t.cancel()
+        _cancel_timer(view.id())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -742,6 +732,23 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                                 if not lines:
                                     clear_phantoms(view)
                                     return
+                                # ── Strip overlap with current line content ───
+                                # e.g. user typed "pub use " and completion
+                                # starts with "pub use session::*;" → strip prefix
+                                row2, _ = view.rowcol(current_cursor)
+                                line_start2 = view.text_point(row2, 0)
+                                line_now = view.substr(
+                                    sublime.Region(line_start2, current_cursor)
+                                ).rstrip()
+                                if line_now and lines[0].startswith(line_now):
+                                    first_stripped = lines[0][len(line_now):]
+                                    if first_stripped or len(lines) > 1:
+                                        lines[0] = first_stripped
+                                        while lines and lines[0].strip() == "":
+                                            lines.pop(0)
+                                if not lines:
+                                    clear_phantoms(view)
+                                    return
                                 # ── Choose display mode ───────────────────────
                                 s = sublime.load_settings("CodeContinue.sublime-settings")
                                 mode = s.get("display_mode", "phantom")
@@ -866,6 +873,7 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
             return
 
         suppress_clear.add(vid)
+        accept_grace[vid] = time.time() + 2.0   # set BEFORE insert so on_modified sees it
         try:
             pos   = view.sel()[0].begin()
             first = lines.pop(0)
@@ -893,7 +901,6 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
             else:
                 clear_phantoms(view)
         finally:
-            accept_grace[vid] = time.time() + 2.0  # 2s: prevents re-trigger after Tab-accept
             suppress_clear.discard(vid)
 
 
@@ -938,13 +945,15 @@ def show_popup_suggestion(view, cursor, suggestion):
 
 
 def _popup_hidden(view):
-    """Called when popup closes for any reason (including backspace)."""
-    # Only clear our state — do NOT close popup (already closed by Sublime)
-    vid = view.id()
-    # If we didn't navigate (e.g. user pressed backspace), just clean up state
-    # but only if popup is truly gone (Sublime calls this after hiding)
-    _popup_suggestion.pop(vid, None)
-    view.settings().erase("code_continue_popup_visible")
+    """Called by Sublime when popup closes for ANY reason (backspace, ESC, click…).
+    We delay the settings clear so that keybindings that caused the close can
+    still see code_continue_popup_visible=True and run correctly."""
+    def _do_clear():
+        _popup_suggestion.pop(view.id(), None)
+        view.settings().erase("code_continue_popup_visible")
+    # 80ms delay: keybinding handlers fire in the same event loop tick,
+    # settings().erase() fires after them
+    sublime.set_timeout(_do_clear, 80)
 
 
 def _popup_navigate(view, href):

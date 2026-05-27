@@ -1,7 +1,6 @@
 // CodeContinue - Key Bindings
 [
-    // ── Inline phantom suggestion ─────────────────────────────────────────────
-    // Accept next line (Tab)
+    // ── Inline phantom ────────────────────────────────────────────────────────
     {
         "keys": [
             "tab"
@@ -14,7 +13,6 @@
             }
         ]
     },
-    // Dismiss (ESC) — falls through to Sublime's ESC when no suggestion
     {
         "keys": [
             "escape"
@@ -27,33 +25,7 @@
             }
         ]
     },
-    // ── Popup suggestion ──────────────────────────────────────────────────────
-    // Accept popup (Tab or Enter)
-    {
-        "keys": [
-            "tab"
-        ],
-        "command": "code_continue_accept_popup",
-        "context": [
-            {
-                "key": "setting.code_continue_popup_visible",
-                "operand": true
-            }
-        ]
-    },
-    {
-        "keys": [
-            "enter"
-        ],
-        "command": "code_continue_accept_popup",
-        "context": [
-            {
-                "key": "setting.code_continue_popup_visible",
-                "operand": true
-            }
-        ]
-    },
-    // Dismiss popup (ESC) — Sublime's built-in backspace/editing still works
+    // ── Popup (Tab/Enter handled by on_text_command, only ESC needs binding) ──
     {
         "keys": [
             "escape"
