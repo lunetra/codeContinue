@@ -160,24 +160,31 @@ def _chat_do_api_call(chat_view, session):
                     sublime.set_timeout(show_empty, 0)
 
         except urllib.error.URLError as e:
-            _log("Chat: Network error: {0}".format(str(e)[:100]))
-            def show_net_err():
+            error_msg = str(e)[:150]
+            _log(f"Chat: Network error: {error_msg}")
+
+            def show_net_err(err=error_msg):
                 if cvid not in _chat_view_ids:
                     return
                 _chat_remove_thinking(chat_view)
-                _chat_view_append(chat_view, "\n⚠ Network error: {0}\n".format(str(e)[:100]))
+                _chat_view_append(chat_view, f"\n⚠ Network error: {err}\n")
                 _chat_show_input_area(chat_view)
                 _chat_requesting.discard(cvid)
+
             sublime.set_timeout(show_net_err, 0)
+
         except Exception as e:
-            _log("Chat: Error: {0}".format(str(e)[:100]))
-            def show_gen_err():
+            error_msg = str(e)[:150]
+            _log(f"Chat: Error: {error_msg}")
+
+            def show_gen_err(err=error_msg):
                 if cvid not in _chat_view_ids:
                     return
                 _chat_remove_thinking(chat_view)
-                _chat_view_append(chat_view, "\n⚠ Error: {0}\n".format(str(e)[:100]))
+                _chat_view_append(chat_view, f"\n⚠ Error: {err}\n")
                 _chat_show_input_area(chat_view)
                 _chat_requesting.discard(cvid)
+
             sublime.set_timeout(show_gen_err, 0)
 
     thread = threading.Thread(target=do_request)
