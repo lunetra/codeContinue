@@ -1,22 +1,13 @@
 // CodeContinue - Key Bindings
-// 
-// No default keybindings are set to avoid conflicts with Sublime Text defaults.
-// 
-// To set up your preferred keybinding:
-// Go to: Preferences > Package Settings > CodeContinue > Key Bindings
-// 
-// Example configurations you can add to your User keymap:
-//
-// Option 1: Tab key (may conflict with autocomplete/indent)
-// { "keys": ["tab"], "command": "code_continue_accept" }
-//
-// Option 2: Right Arrow key
-// { "keys": ["right"], "command": "code_continue_accept" }
-//
-// Option 3: Ctrl+Enter
-// { "keys": ["ctrl+enter"], "command": "code_continue_accept" }
-//
-// Option 4: End key
-// { "keys": ["end"], "command": "code_continue_accept" }
+[
+    // Accept next line of suggestion
+    { "keys": ["super+1"], "command": "code_continue_accept",
+      "context": [{"key": "setting.code_continue_visible", "operand": "true"}] },
 
-[]
+    // Dismiss suggestion / cancel in-flight request
+    { "keys": ["escape"], "command": "code_continue_dismiss",
+      "context": [{"key": "setting.code_continue_visible", "operand": "true"}] },
+
+    // Manual trigger (works even when auto_trigger is off)
+    { "keys": ["ctrl+enter"], "command": "code_continue_suggest" }
+]

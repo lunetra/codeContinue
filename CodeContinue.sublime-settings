@@ -15,49 +15,60 @@
     //
     "models": [
         {
-            "name":        "g-flash",
-            "enabled":     true,
-            "endpoint":    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            "model":       "gemini-2.5-flash-lite",
-            "api_keys":    [
+            "name": "g-flash",
+            "enabled": true,
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "model": "gemini-2.5-flash-lite",
+            "api_keys": [
                 "YOUR_GEMINI_KEY_1",
                 "YOUR_GEMINI_KEY_2"
             ],
             "temperature": 0.1,
-            "max_tokens":  100,
-            "timeout_ms":  12000
+            "max_tokens": 100,
+            "timeout_ms": 12000
         },
         {
-            "name":        "gpt-mini",
-            "enabled":     true,
-            "endpoint":    "https://models.inference.ai.azure.com/chat/completions",
-            "model":       "gpt-4o-mini",
-            "api_keys":    [
+            "name": "gpt-mini",
+            "enabled": true,
+            "endpoint": "https://models.inference.ai.azure.com/chat/completions",
+            "model": "gpt-4o-mini",
+            "api_keys": [
                 "YOUR_GITHUB_PAT_1",
                 "YOUR_GITHUB_PAT_2"
             ],
             "temperature": 0.1,
-            "max_tokens":  100,
-            "timeout_ms":  12000
+            "max_tokens": 100,
+            "timeout_ms": 12000
         },
         {
-            "name":        "local-3b",
-            "enabled":     false,
-            "endpoint":    "http://localhost:11434/v1/chat/completions",
-            "model":       "qwen2.5-coder:3b",
-            "api_keys":    ["ollama"],
+            "name": "local-3b",
+            "enabled": false,
+            "endpoint": "http://localhost:11434/v1/chat/completions",
+            "model": "qwen2.5-coder:3b",
+            "api_keys": [
+                "ollama"
+            ],
             "temperature": 0.2,
-            "max_tokens":  150,
-            "timeout_ms":  30000
+            "max_tokens": 150,
+            "timeout_ms": 30000
         }
     ],
-
+    
     // ── Shared settings ───────────────────────────────────────────────────────
     //
     // These apply to all models.
-
     // Total code lines sent around the cursor (⅔ before, ⅓ after).
     "max_context_lines": 60,
+
+    // ── Trigger ───────────────────────────────────────────────────────────────
+    //
+    // auto_trigger: fire a suggestion automatically after typing pauses.
+    // auto_trigger_delay: seconds of idle time before firing (0.5 – 1.5).
+    //   Lower = more responsive but more API calls.
+    //   Higher = fewer calls, suggestion arrives after you've thought a bit.
+    //
+    "auto_trigger": true,
+    "auto_trigger_delay": 0.9,
 
     // Sibling .rs file names are always included for Rust (cheap, useful for
     // mod.rs files). Set index_neighboring_files to true to also include
@@ -67,7 +78,9 @@
     // Languages that trigger completions (file extension without dot).
     // Empty array = all file types.
     "trigger_language": [
-        "rs", "toml", "sql"
+        "rs",
+        "toml",
+        "sql"
     ],
 
     // Show detailed logs in View > Show Console.

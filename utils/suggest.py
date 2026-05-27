@@ -1,4 +1,14 @@
-"""suggest.py — CodeContinue inline code completion engine."""
+"""suggest.py — CodeContinue inline code completion engine.
+
+Improvements in this version:
+  - Multi-line phantom with proper <br> HTML rendering
+  - Debounced auto-trigger: fires after N seconds of typing pause (configurable)
+  - Response alignment: when response arrives, strip the part the user already
+    typed since the request was made — so suggestion always starts at cursor
+  - Compatibility check: if suggestion is incompatible with what was typed, discard
+  - Smart mod.rs context: detects module files and adds pattern hint to prompt
+  - ESC dismiss via keybinding (CodeContinueDismissCommand)
+"""
 
 import html
 import json
@@ -79,25 +89,63 @@ def detect_language(view):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sibling module listing (same dir, same extension)
+# Context helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def list_sibling_modules(file_path, ext):
+    """Return sorted stems of sibling files with the same extension."""
     if not file_path or not ext or ext == "_default":
-        return ""
+        return []
     d   = os.path.dirname(file_path)
     cur = os.path.basename(file_path)
     try:
-        stems = sorted(
+        return sorted(
             os.path.splitext(f)[0]
             for f in os.listdir(d)
             if f.endswith("." + ext) and f != cur and not f.startswith(".")
-        )
-        if stems:
-            return ", ".join(stems[:25])
+        )[:25]
     except OSError:
-        pass
-    return ""
+        return []
+
+
+def _is_mod_rs(file_path):
+    """Return True if this is a Rust module index file (mod.rs or lib.rs)."""
+    if not file_path:
+        return False
+    base = os.path.basename(file_path)
+    return base in ("mod.rs", "lib.rs")
+
+
+def build_extra_context(view, file_path, ext, settings):
+    """Build the extra project context injected into the system prompt."""
+    parts = []
+
+    siblings = list_sibling_modules(file_path, ext)
+    if siblings:
+        parts.append(
+            "Other {0} files in same directory: {1}".format(ext, ", ".join(siblings))
+        )
+
+    # Rust-specific context
+    if ext == "rs":
+        if _is_mod_rs(file_path):
+            # Help the model understand what mod.rs is for
+            parts.append(
+                "This is a Rust module file (mod.rs / lib.rs). "
+                "Its job is to declare submodules with `mod X;` and "
+                "optionally re-export items with `pub use X::something;`. "
+                "Use ONLY the filenames listed above as module names."
+            )
+
+        if settings.get("index_neighboring_files", False) and file_path:
+            view_content = view.substr(sublime.Region(0, view.size()))
+            sym_ctx = get_symbol_context(
+                file_path, view_content, index_neighbors=True, max_chars=300,
+            )
+            if sym_ctx:
+                parts.append(sym_ctx)
+
+    return "\n".join(parts)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -116,20 +164,71 @@ def clean_completion(text):
     """Strip markdown fences, special tokens, and trailing explanations."""
     if not text:
         return ""
-    # Strip leading fence (```rust, ```, etc.)
     text = re.sub(r"^\s*```[a-zA-Z_+\-]*\s*\n?", "", text)
-    # Drop everything after a closing fence (explanations)
     if "```" in text:
         text = text.split("```", 1)[0]
-    # Strip special LLM tokens
     text = _SPECIAL_TOKEN_RE.sub("", text)
-    # Remove leading/trailing blank lines, preserve internal indentation
     lines = text.split("\n")
     while lines and lines[0].strip() == "":
         lines.pop(0)
     while lines and lines[-1].strip() == "":
         lines.pop()
     return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Response alignment
+# ──────────────────────────────────────────────────────────────────────────────
+
+def align_completion(completion, typed_since_request):
+    """
+    When a response arrives after the user has continued typing, align it.
+
+    Cases:
+      A) User typed nothing extra → return completion as-is
+      B) Completion starts with what user typed → strip that prefix
+      C) Completion is compatible (starts at the right place) → trim
+      D) Completion is incompatible → return "" (discard)
+
+    "Compatible" means the completion's first non-whitespace content
+    matches or overlaps with where the user's cursor now sits.
+    """
+    if not typed_since_request:
+        return completion
+
+    typed = typed_since_request
+
+    # Normalise: strip trailing whitespace/newlines from typed
+    typed_stripped = typed.rstrip()
+    if not typed_stripped:
+        return completion
+
+    # Case B: completion begins with what was typed (common case)
+    if completion.startswith(typed_stripped):
+        rest = completion[len(typed_stripped):]
+        # Strip a single leading newline if the typed text ended mid-line
+        if rest.startswith("\n"):
+            rest = rest[1:]
+        result = rest.lstrip("\n") if not typed_stripped.endswith("\n") else rest
+        return result.rstrip("\n") if result else ""
+
+    # Case C: find where typed_stripped first appears in completion
+    # (user typed something the model also predicted)
+    idx = completion.find(typed_stripped)
+    if idx != -1:
+        rest = completion[idx + len(typed_stripped):]
+        return rest.lstrip("\n").rstrip("\n")
+
+    # Case D: if the user typed something substantive (>3 chars) that doesn't
+    # appear anywhere in the completion, the suggestion is stale — discard.
+    if len(typed_stripped) >= 10 and typed_stripped not in completion:
+        _log("Discarding stale completion (typed={0!r})".format(
+            typed_stripped[:40]
+        ))
+        return ""
+
+    # Minimal typed text (newline, 1-3 chars) — keep completion as-is
+    return completion
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,9 +245,9 @@ def build_messages(code_before, code_after, lang, extra_context):
         "Rules:\n"
         "1. Output ONLY raw code — no markdown fences, no backticks, no explanations.\n"
         "2. Match the existing indentation and code style exactly.\n"
-        "3. Output 1-4 lines that naturally continue the pattern shown.\n"
-        "4. Use only names, types, and modules already visible in the context.\n"
-        "5. Never repeat code that already exists. Never invent new abstractions.\n"
+        "3. Output 1-5 lines that naturally continue the pattern shown.\n"
+        "4. Use ONLY names, types, and modules already visible in the context.\n"
+        "5. Never repeat code that already exists. Never invent new names.\n"
         "6. Stop when the immediate logical unit is complete."
     ).format(name=name)
 
@@ -178,32 +277,47 @@ def build_messages(code_before, code_after, lang, extra_context):
 # Plugin state
 # ──────────────────────────────────────────────────────────────────────────────
 
-phantoms         = {}
-last_request     = {}
-pending_requests = {}
-suppress_clear   = set()
-accept_grace     = {}
+phantoms          = {}   # view.id() -> (PhantomSet, [lines], common_prefix)
+pending_requests  = {}   # view.id() -> (request_id, cancel_event)
+suppress_clear    = set()
+accept_grace      = {}   # view.id() -> float
+_auto_timers      = {}   # view.id() -> threading.Timer  (debounce)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Phantom display
+# Phantom display  — multi-line with <br>
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _lines_to_html(lines):
+    """Convert a list of code lines to inline HTML with proper line breaks."""
+    escaped = [html.escape(l).replace(" ", "&nbsp;") for l in lines]
+    return "<br>".join(escaped)
+
 
 def show_phantom(view, cursor, suggestion):
     clear_phantoms(view)
     ps    = sublime.PhantomSet(view)
     lines = suggestion.split("\n")
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-    norm, prefix = strip_common_indent(lines)
-    preview = "\n".join(norm)
-    if not preview:
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    while lines and lines[0].strip() == "":
+        lines.pop(0)
+    if not lines:
         return
+
+    norm, prefix = strip_common_indent(lines)
+
+    content = (
+        '<body id="cc-phantom">'
+        '<span style="color:#888888;font-style:italic;">'
+        '{0}'
+        '</span>'
+        '</body>'
+    ).format(_lines_to_html(norm))
+
     ph = sublime.Phantom(
         sublime.Region(cursor, cursor),
-        '<span style="color:gray;font-style:italic;">{0}</span>'.format(
-            html.escape(preview)
-        ),
+        content,
         sublime.LAYOUT_INLINE,
     )
     ps.update([ph])
@@ -228,21 +342,17 @@ def _clear_status(view):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Settings helpers
+# Settings / pool helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _reload_pool():
     settings = sublime.load_settings("CodeContinue.sublime-settings")
     ok = load_pool_from_settings(settings)
     if ok:
-        _log("Model pool loaded: {0}".format(get_pool().model_names()))
+        _log("Pool: {0}".format(get_pool().model_names()))
     else:
-        _log_error("No models configured in CodeContinue.sublime-settings")
+        _log_error("No models configured.")
     return ok
-
-
-def _is_pool_ready():
-    return len(get_pool().model_names()) > 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -253,29 +363,70 @@ class CodeContinueListener(sublime_plugin.EventListener):
 
     def on_modified(self, view):
         vid = view.id()
-        if vid not in phantoms:
+
+        # Clear phantom on any edit (unless Tab-accept is in progress)
+        if vid in phantoms:
+            if vid not in suppress_clear and time.time() >= accept_grace.get(vid, 0):
+                clear_phantoms(view)
+
+        # ── Debounced auto-trigger ────────────────────────────────────────────
+        settings = sublime.load_settings("CodeContinue.sublime-settings")
+        if not settings.get("auto_trigger", True):
             return
-        if vid in suppress_clear:
+
+        # Check language is enabled
+        trigger_langs = settings.get("trigger_language", [])
+        _, ext = detect_language(view)
+        syntax = view.syntax()
+        syntax_name = syntax.name.lower() if syntax else ""
+        if trigger_langs and not (
+            ext in [t.lower() for t in trigger_langs]
+            or any(t.lower() in syntax_name for t in trigger_langs)
+        ):
             return
-        if time.time() < accept_grace.get(vid, 0):
-            return
-        clear_phantoms(view)
+
+        # Cancel previous timer
+        old_timer = _auto_timers.get(vid)
+        if old_timer:
+            old_timer.cancel()
+
+        delay = settings.get("auto_trigger_delay", 0.9)
+
+        def _fire():
+            # Run on the Sublime main thread
+            sublime.set_timeout(
+                lambda: view.run_command("code_continue_suggest"), 0
+            )
+
+        timer = threading.Timer(delay, _fire)
+        _auto_timers[vid] = timer
+        timer.start()
 
     def on_post_save(self, view):
         fp = view.file_name()
         if fp:
             on_file_saved(fp)
+        # Cancel any pending auto-trigger on save
+        vid = view.id()
+        t = _auto_timers.pop(vid, None)
+        if t:
+            t.cancel()
 
     def on_text_command(self, view, command_name, args):
+        """Intercept Enter to optionally trigger (legacy Enter-based mode)."""
         if command_name != "insert" or not args or args.get("characters") != "\n":
             return None
 
-        settings      = sublime.load_settings("CodeContinue.sublime-settings")
-        trigger_langs = settings.get("trigger_language", [])
-        _, ext        = detect_language(view)
-        syntax        = view.syntax()
-        syntax_name   = syntax.name.lower() if syntax else ""
+        settings = sublime.load_settings("CodeContinue.sublime-settings")
 
+        # If auto_trigger is on, Enter-based trigger is redundant — skip
+        if settings.get("auto_trigger", True):
+            return None
+
+        trigger_langs = settings.get("trigger_language", [])
+        _, ext = detect_language(view)
+        syntax = view.syntax()
+        syntax_name = syntax.name.lower() if syntax else ""
         if trigger_langs and not (
             ext in [t.lower() for t in trigger_langs]
             or any(t.lower() in syntax_name for t in trigger_langs)
@@ -285,11 +436,6 @@ class CodeContinueListener(sublime_plugin.EventListener):
         vid = view.id()
         if vid in phantoms:
             return None
-
-        now = time.time()
-        if now - last_request.get(vid, 0) < 1.0:
-            return None
-        last_request[vid] = now
 
         sublime.set_timeout(lambda: view.run_command("code_continue_suggest"), 50)
         return None
@@ -305,10 +451,8 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         view     = self.view
         settings = sublime.load_settings("CodeContinue.sublime-settings")
 
-        # Reload pool from settings on each request so live edits to settings
-        # take effect without restarting Sublime.
         if not _reload_pool():
-            _set_status(view, "CC: No models configured")
+            _set_status(view, "CC: no models configured")
             sublime.set_timeout(lambda: show_endpoint_config_panel(view), 100)
             return
 
@@ -318,6 +462,7 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
 
         cursor    = sel[0].begin()
         lang, ext = detect_language(view)
+        file_path = view.file_name()
         _log("Language: {0} (ext={1})".format(lang["name"], ext))
 
         # ── Context window ────────────────────────────────────────────────────
@@ -337,30 +482,9 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         code_after  = full[off:]
 
         # ── Extra context ─────────────────────────────────────────────────────
-        extra_parts = []
-        file_path   = view.file_name()
-
-        siblings = list_sibling_modules(file_path, ext)
-        if siblings:
-            extra_parts.append(
-                "Other {0} files in same directory: {1}".format(ext, siblings)
-            )
-
-        if ext == "rs" and settings.get("index_neighboring_files", False):
-            if file_path:
-                view_content = view.substr(sublime.Region(0, view.size()))
-                sym_ctx = get_symbol_context(
-                    file_path, view_content,
-                    index_neighbors=True, max_chars=300,
-                )
-                if sym_ctx:
-                    extra_parts.append(sym_ctx)
-
-        extra_context = "\n".join(extra_parts)
+        extra_context = build_extra_context(view, file_path, ext, settings)
         if extra_context:
-            _log("Extra context ({0} chars):\n{1}".format(
-                len(extra_context), extra_context[:300]
-            ))
+            _log("Context: {0}".format(extra_context[:200]))
 
         messages = build_messages(code_before, code_after, lang, extra_context)
 
@@ -374,11 +498,11 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
         req_id = (vid, cursor, time.time())
         pending_requests[vid] = (req_id, cancel)
 
+        # ── Track cursor position at request time (for alignment) ─────────────
+        request_cursor = cursor   # captured now; user may move cursor while waiting
+
         def fetch():
             pool = get_pool()
-
-            # Try models in rotation. If a 429 happens, mark the key and retry
-            # with the next available model/key — up to len(pool) attempts.
             max_attempts = max(1, len(pool.model_names()) * 2)
 
             for attempt in range(max_attempts):
@@ -387,7 +511,6 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                 if pending_requests.get(vid, (None,))[0] != req_id:
                     return
 
-                # ── Acquire a model slot ──────────────────────────────────────
                 try:
                     slot = pool.acquire()
                 except NoModelsError as e:
@@ -397,14 +520,13 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                     )
                     return
 
-                _log("Using [{0}] attempt {1}".format(slot.display_name, attempt + 1))
+                _log("[{0}] attempt {1}".format(slot.display_name, attempt + 1))
                 sublime.set_timeout(
                     lambda n=slot.display_name: _set_status(
                         view, "CC: [{0}] …".format(n)
                     ), 0
                 )
 
-                # ── Build request ─────────────────────────────────────────────
                 headers = {
                     "Content-Type":  "application/json",
                     "Authorization": "Bearer {0}".format(slot.key),
@@ -417,7 +539,6 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                     "top_p":       slot.top_p,
                 }
 
-                # ── Make the call ─────────────────────────────────────────────
                 try:
                     req = urllib.request.Request(
                         slot.endpoint,
@@ -435,47 +556,66 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                             )
 
                     pool.report_success(slot)
-                    _log("Raw response [{0}] ({1} chars): {2!r}".format(
-                        slot.display_name, len(raw), raw[:200]
-                    ))
 
                     if cancel.is_set():
                         return
                     if pending_requests.get(vid, (None,))[0] != req_id:
                         return
 
+                    _log("Raw [{0}]: {1!r}".format(slot.display_name, raw[:200]))
                     completion = clean_completion(raw)
-                    _log("Cleaned [{0}]: {1!r}".format(
-                        slot.display_name, completion[:120]
-                    ))
 
-                    if completion:
-                        sublime.set_timeout(
-                            lambda c=completion: _present(view, cursor, c), 0
-                        )
-                    else:
+                    if not completion:
                         sublime.set_timeout(
                             lambda: _set_status(view, "CC: no suggestion"), 0
                         )
-                    return  # ← done
+                        return
+
+                    # ── Alignment: what did the user type since request? ───────
+                    def _show_aligned(comp=completion, req_cur=request_cursor):
+                        current_sel = view.sel()
+                        if len(current_sel) != 1:
+                            _clear_status(view)
+                            return
+
+                        current_cursor = current_sel[0].begin()
+
+                        # Get text typed since request was sent
+                        if current_cursor > req_cur:
+                            typed_since = view.substr(
+                                sublime.Region(req_cur, current_cursor)
+                            )
+                        else:
+                            typed_since = ""
+
+                        aligned = align_completion(comp, typed_since)
+                        _log("Aligned (typed={0!r}): {1!r}".format(
+                            typed_since[:40], aligned[:80]
+                        ))
+
+                        if aligned:
+                            show_phantom(view, current_cursor, aligned)
+                        _clear_status(view)
+
+                    sublime.set_timeout(_show_aligned, 0)
+                    return
 
                 except urllib.error.HTTPError as e:
                     if e.code == 429:
-                        _log("429 on [{0}], rotating key …".format(slot.display_name))
+                        _log("429 [{0}], rotating …".format(slot.display_name))
                         pool.report_429(slot)
-                        # Loop → try next slot
                     else:
-                        _log_error("HTTP {0} on [{1}]".format(e.code, slot.display_name))
+                        _log_error("HTTP {0} [{1}]".format(e.code, slot.display_name))
                         pool.report_error(slot)
                         sublime.set_timeout(
                             lambda c=e.code: _set_status(
-                                view, "CC: HTTP {0} error".format(c)
+                                view, "CC: HTTP {0}".format(c)
                             ), 0
                         )
                         return
 
                 except urllib.error.URLError as e:
-                    _log_error("Network error on [{0}]: {1}".format(
+                    _log_error("Network [{0}]: {1}".format(
                         slot.display_name, str(e)[:80]
                     ))
                     pool.report_error(slot)
@@ -485,7 +625,7 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                     return
 
                 except Exception as e:
-                    _log_error("Error on [{0}]: {1}".format(
+                    _log_error("Error [{0}]: {1}".format(
                         slot.display_name, str(e)[:80]
                     ))
                     pool.report_error(slot)
@@ -494,17 +634,11 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                     )
                     return
 
-            # Exhausted all attempts
             sublime.set_timeout(
-                lambda: _set_status(view, "CC: all models busy, try again soon"), 0
+                lambda: _set_status(view, "CC: all models busy"), 0
             )
 
         threading.Thread(target=fetch, daemon=True).start()
-
-
-def _present(view, cursor, text):
-    _clear_status(view)
-    show_phantom(view, cursor, text)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -540,16 +674,45 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
             view.sel().add(sublime.Region(new_pos, new_pos))
 
             if rem:
+                norm, prefix = strip_common_indent(rem)
                 ps.update([sublime.Phantom(
                     sublime.Region(new_pos, new_pos),
-                    '<span style="color:gray;font-style:italic;">{0}</span>'.format(
-                        html.escape("\n".join(rem))
-                    ),
+                    '<body id="cc-phantom">'
+                    '<span style="color:#888888;font-style:italic;">{0}</span>'
+                    '</body>'.format(_lines_to_html(norm)),
                     sublime.LAYOUT_INLINE,
                 )])
-                phantoms[vid] = (ps, rem, "")
+                phantoms[vid] = (ps, rem, prefix)
             else:
                 clear_phantoms(view)
         finally:
             accept_grace[vid] = time.time() + 0.25
             suppress_clear.discard(vid)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dismiss command  (ESC)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CodeContinueDismissCommand(sublime_plugin.TextCommand):
+
+    def run(self, edit):
+        view = self.view
+        vid  = view.id()
+
+        # Cancel in-flight request
+        old = pending_requests.get(vid)
+        if old:
+            old[1].set()
+
+        # Cancel pending auto-trigger
+        t = _auto_timers.pop(vid, None)
+        if t:
+            t.cancel()
+
+        clear_phantoms(view)
+        _clear_status(view)
+
+    def is_enabled(self):
+        vid = self.view.id()
+        return vid in phantoms or vid in pending_requests
