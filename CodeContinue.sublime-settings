@@ -1,91 +1,63 @@
 {
     // ── Models ────────────────────────────────────────────────────────────────
-    //
-    // List of models tried in order. When a key hits 429, the next key of the
-    // same model is tried. When all keys of a model are cooling down, the next
-    // model is tried. After the last model, rotation wraps back to the first.
-    //
-    // Per model:
-    //   name     - nickname shown in the status bar (e.g. "CC: [g-flash] …")
-    //   enabled  - set false to skip this model without deleting the config
-    //   endpoint - OpenAI-compatible chat completions URL
-    //   model    - model string passed to the API
-    //   api_keys - one or more API keys; rotated on 429
-    //   temperature, max_tokens, timeout_ms - override per model (optional)
-    //
+    // Each model can have multiple api_keys — rotated on 429.
+    // Local Ollama models with /api/generate use TRUE FIM (best for autocomplete).
+    // Cloud models with /v1/chat/completions use a FIM-style chat prompt.
     "models": [
         {
-            "name": "g-flash",
-            "enabled": true,
-            "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            "model": "gemini-2.5-flash-lite",
-            "api_keys": [
-                "YOUR_GEMINI_KEY_1",
-                "YOUR_GEMINI_KEY_2"
-            ],
+            "name":        "phi4-local",
+            "enabled":     true,
+            "endpoint":    "http://127.0.0.1:11434/api/generate",
+            "model":       "phi4-mini",
+            "api_keys":    ["ollama"],
             "temperature": 0.1,
-            "max_tokens": 100,
-            "timeout_ms": 12000
+            "max_tokens":  80,
+            "timeout_ms":  12000,
+            "use_fim":     true
         },
         {
-            "name": "gpt-mini",
-            "enabled": true,
-            "endpoint": "https://models.inference.ai.azure.com/chat/completions",
-            "model": "gpt-4o-mini",
-            "api_keys": [
-                "YOUR_GITHUB_PAT_1",
-                "YOUR_GITHUB_PAT_2"
-            ],
+            "name":        "g-flash",
+            "enabled":     true,
+            "endpoint":    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "model":       "gemini-2.5-flash-lite",
+            "api_keys":    ["YOUR_KEY_1", "YOUR_KEY_2"],
             "temperature": 0.1,
-            "max_tokens": 100,
-            "timeout_ms": 12000
+            "max_tokens":  100,
+            "timeout_ms":  12000,
+            "use_fim":     false
         },
         {
-            "name": "local-3b",
-            "enabled": false,
-            "endpoint": "http://localhost:11434/v1/chat/completions",
-            "model": "qwen2.5-coder:3b",
-            "api_keys": [
-                "ollama"
-            ],
-            "temperature": 0.2,
-            "max_tokens": 150,
-            "timeout_ms": 30000
+            "name":        "gpt-mini",
+            "enabled":     false,
+            "endpoint":    "https://models.inference.ai.azure.com/chat/completions",
+            "model":       "gpt-4o-mini",
+            "api_keys":    ["YOUR_GITHUB_PAT"],
+            "temperature": 0.1,
+            "max_tokens":  100,
+            "timeout_ms":  12000,
+            "use_fim":     false
         }
     ],
 
-    // ── Shared settings ───────────────────────────────────────────────────────
-    //
-    // These apply to all models.
-    // Total code lines sent around the cursor (⅔ before, ⅓ after).
-    "max_context_lines": 60,
-
     // ── Trigger ───────────────────────────────────────────────────────────────
-    //
-    // auto_trigger: fire a suggestion automatically after typing pauses.
-    // auto_trigger_delay: seconds of idle time before firing (0.5 – 1.5).
-    //   Lower = more responsive but more API calls.
-    //   Higher = fewer calls, suggestion arrives after you've thought a bit.
-    //
-    "auto_trigger": true,
-    "auto_trigger_delay": 0.9,
-    "auto_trigger_min_chars": 4,
-    
-    "display_mode": "phantom", // or "popup"
+    // auto_trigger: fires after typing pauses, only when cursor is at an
+    //   "incomplete" position (mid-expression, mid-word, NOT after ; { })
+    "auto_trigger":          true,
+    "auto_trigger_delay":    0.8,
+    "auto_trigger_min_chars": 3,
 
-    // Sibling .rs file names are always included for Rust (cheap, useful for
-    // mod.rs files). Set index_neighboring_files to true to also include
-    // function/struct/enum signatures from neighboring files.
+    // ── Display ───────────────────────────────────────────────────────────────
+    // "phantom" = inline ghost text (Tab accepts one line at a time)
+    // "popup"   = full suggestion panel (Tab/Enter accepts all at once)
+    "display_mode": "phantom",
+
+    // ── Context ───────────────────────────────────────────────────────────────
+    "max_context_lines":       60,
     "index_neighboring_files": false,
 
-    // Languages that trigger completions (file extension without dot).
-    // Empty array = all file types.
-    "trigger_language": [
-        "rs",
-        "toml",
-        "sql"
-    ],
+    // ── Languages ─────────────────────────────────────────────────────────────
+    "trigger_language": ["rs", "toml", "sql"],
 
-    // Show detailed logs in View > Show Console.
+    // ── Debug ─────────────────────────────────────────────────────────────────
     "debug": false
 }
