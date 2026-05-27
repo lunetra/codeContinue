@@ -372,8 +372,9 @@ class _Spinner:
 phantoms         = {}   # view.id() -> (PhantomSet, [lines], cursor)
 pending_requests = {}   # view.id() -> (request_id, cancel_event)
 suppress_clear   = set()
-accept_grace     = {}   # view.id() -> float
+accept_grace     = {}   # view.id() -> float  (also blocks auto-trigger)
 _auto_timers     = {}   # view.id() -> threading.Timer
+_last_cmd        = {}   # view.id() -> (command_name, args)  set by on_text_command
 _spinner         = _Spinner()
 
 
@@ -405,11 +406,15 @@ def _stream_completion(resp, on_line, on_done, cancel_event):
     """
     buffer    = ""
     full_text = ""
-    pending   = []   # complete lines not yet emitted
 
-    for raw in resp:
+    # readline() reads one SSE line at a time — required for true streaming.
+    # for-loop over resp reads arbitrary HTTP chunks which may bundle many events.
+    while True:
         if cancel_event.is_set():
             return
+        raw = resp.readline()
+        if not raw:
+            break  # connection closed
 
         line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
         if not line:
@@ -429,7 +434,7 @@ def _stream_completion(resp, on_line, on_done, cancel_event):
         buffer    += content
         full_text += content
 
-        # Emit complete lines as they arrive
+        # Emit each complete code line as it arrives
         while "\n" in buffer:
             nl_pos   = buffer.index("\n")
             complete = buffer[:nl_pos]
@@ -438,7 +443,7 @@ def _stream_completion(resp, on_line, on_done, cancel_event):
             if cleaned:
                 on_line(cleaned)
 
-    # Emit any remaining partial line
+    # Emit any remaining content (last line without trailing newline)
     if buffer.strip():
         cleaned = clean_completion(buffer)
         if cleaned:
@@ -453,8 +458,14 @@ def _stream_completion(resp, on_line, on_done, cancel_event):
 
 class CodeContinueListener(sublime_plugin.EventListener):
 
+    def on_text_command(self, view, command_name, args):
+        """Track which command caused the next on_modified."""
+        _last_cmd[view.id()] = (command_name, args or {})
+        return None
+
     def on_modified(self, view):
         vid = view.id()
+        cmd, args = _last_cmd.pop(vid, (None, {}))
 
         # Clear phantom on any edit (unless Tab-accept is in progress)
         if vid in phantoms:
@@ -463,6 +474,19 @@ class CodeContinueListener(sublime_plugin.EventListener):
 
         settings = sublime.load_settings("CodeContinue.sublime-settings")
         if not settings.get("auto_trigger", True):
+            return
+
+        # ── Only trigger on a single printable character being typed ──────────
+        # Ignore: backspace, delete, enter, paste, Tab-accept, undo, redo, etc.
+        if cmd != "insert":
+            return
+        typed_char = args.get("characters", "")
+        # Must be exactly one non-whitespace, non-newline character
+        if len(typed_char) != 1 or typed_char in " \t\n\r":
+            return
+
+        # ── Grace period after Tab-accept: don't re-trigger immediately ───────
+        if time.time() < accept_grace.get(vid, 0):
             return
 
         # ── Language gate ─────────────────────────────────────────────────────
@@ -476,21 +500,25 @@ class CodeContinueListener(sublime_plugin.EventListener):
         ):
             return
 
-        # ── Guard: don't trigger on blank lines or too-short lines ────────────
+        # ── Guard: current line must have enough content ──────────────────────
         sel = view.sel()
         if not sel:
             return
         cursor = sel[0].begin()
-        row, col = view.rowcol(cursor)
+        row, _col = view.rowcol(cursor)
         line_start = view.text_point(row, 0)
-        line_before_cursor = view.substr(
-            sublime.Region(line_start, cursor)
-        ).rstrip()
+        line_text  = view.substr(sublime.Region(line_start, cursor))
 
         min_chars = settings.get("auto_trigger_min_chars", 4)
-        # Count only non-whitespace content on the current line
-        if len(line_before_cursor.strip()) < min_chars:
-            # Cancel any pending timer — line is too short
+        if len(line_text.strip()) < min_chars:
+            t = _auto_timers.pop(vid, None)
+            if t:
+                t.cancel()
+            return
+
+        # ── Guard: don't trigger when line already ends a complete statement ───
+        stripped = line_text.rstrip()
+        if stripped and stripped[-1] in ";{}":
             t = _auto_timers.pop(vid, None)
             if t:
                 t.cancel()
@@ -705,7 +733,7 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                                 if not aligned:
                                     clear_phantoms(view)
                                     return
-                                # Final, definitive phantom from aligned full text
+                                # Clean up aligned text
                                 lines = [l for l in aligned.split("\n")]
                                 while lines and lines[0].strip() == "":
                                     lines.pop(0)
@@ -714,8 +742,18 @@ class CodeContinueSuggestCommand(sublime_plugin.TextCommand):
                                 if not lines:
                                     clear_phantoms(view)
                                     return
-                                display = ([""] + lines) if nl else lines
-                                show_phantom(view, current_cursor, display)
+                                # ── Choose display mode ───────────────────────
+                                s = sublime.load_settings("CodeContinue.sublime-settings")
+                                mode = s.get("display_mode", "phantom")
+                                if mode == "popup":
+                                    clear_phantoms(view)
+                                    show_popup_suggestion(
+                                        view, current_cursor,
+                                        "\n".join(lines)
+                                    )
+                                else:
+                                    display = ([""] + lines) if nl else lines
+                                    show_phantom(view, current_cursor, display)
 
                             sublime.set_timeout(_align_and_show, 0)
 
@@ -855,8 +893,76 @@ class CodeContinueAcceptCommand(sublime_plugin.TextCommand):
             else:
                 clear_phantoms(view)
         finally:
-            accept_grace[vid] = time.time() + 0.25
+            accept_grace[vid] = time.time() + 2.0  # 2s: prevents re-trigger after Tab-accept
             suppress_clear.discard(vid)
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Popup mode  (view.show_popup with Accept / Dismiss buttons)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_popup_suggestion = {}   # view.id() -> (cursor, full_text)
+
+
+def show_popup_suggestion(view, cursor, suggestion):
+    """Show the full suggestion in a popup panel with Accept/Dismiss buttons."""
+    _popup_suggestion[view.id()] = (cursor, suggestion)
+    lines   = suggestion.split("\n")
+    code_html = "<br>".join(
+        html.escape(l).replace(" ", "&nbsp;") for l in lines
+    )
+    content = (
+        '<body style="margin:0;padding:0;">'
+        '<div style="padding:6px 8px;font-family:monospace;font-size:0.95em;'
+        'color:#cdd9e5;background:#22272e;border-bottom:1px solid #444c56;">'
+        '{code}'
+        '</div>'
+        '<div style="padding:4px 8px;background:#2d333b;">'
+        '<a href="accept" style="color:#57ab5a;text-decoration:none;">✓ Accept</a>'
+        '&nbsp;&nbsp;&nbsp;'
+        '<a href="dismiss" style="color:#e5534b;text-decoration:none;">✗ Dismiss</a>'
+        '</div>'
+        '</body>'
+    ).format(code=code_html)
+    view.show_popup(
+        content,
+        flags=sublime.COOPERATE_WITH_AUTO_COMPLETE,
+        location=cursor,
+        max_width=700,
+        max_height=350,
+        on_navigate=lambda href: _popup_navigate(view, href),
+        on_hide=lambda: _popup_suggestion.pop(view.id(), None),
+    )
+
+
+def _popup_navigate(view, href):
+    vid = view.id()
+    if href == "accept":
+        entry = _popup_suggestion.pop(vid, None)
+        if entry:
+            _cursor, text = entry
+            view.run_command("code_continue_accept_popup", {"text": text})
+    else:
+        _popup_suggestion.pop(vid, None)
+    view.hide_popup()
+
+
+class CodeContinueAcceptPopupCommand(sublime_plugin.TextCommand):
+    """Insert the full popup suggestion at the cursor position."""
+    def run(self, edit, text=""):
+        view = self.view
+        sel  = view.sel()
+        if not sel:
+            return
+        pos = sel[0].begin()
+        # If cursor is after a complete statement, prepend newline
+        row, _ = view.rowcol(pos)
+        line_start = view.text_point(row, 0)
+        line_text  = view.substr(sublime.Region(line_start, pos)).rstrip()
+        if line_text and line_text[-1] in ";{}":
+            text = "\n" + text
+        view.insert(edit, pos, text)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

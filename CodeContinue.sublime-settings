@@ -70,6 +70,8 @@
     "auto_trigger": true,
     "auto_trigger_delay": 0.9,
     "auto_trigger_min_chars": 4,
+    
+    "display_mode": "phantom", // or "popup"
 
     // Sibling .rs file names are always included for Rust (cheap, useful for
     // mod.rs files). Set index_neighboring_files to true to also include
